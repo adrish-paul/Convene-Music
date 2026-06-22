@@ -24,6 +24,18 @@ data class Song(
 )
 
 @Serializable
+data class LyricLine(
+    val timestampMs: Long,
+    val text: String
+)
+
+@Serializable
+data class LyricsData(
+    val isSynced: Boolean,
+    val lines: List<LyricLine>
+)
+
+@Serializable
 data class Playlist(
     val id: String,
     val title: String,
@@ -326,6 +338,29 @@ class InnerTubeClient {
         }
     }
 
+    private fun parseDurationTextToSeconds(durationText: String): Int {
+        val parts = durationText.split(":")
+        return try {
+            when (parts.size) {
+                1 -> parts[0].toIntOrNull() ?: 0
+                2 -> {
+                    val minutes = parts[0].toIntOrNull() ?: 0
+                    val seconds = parts[1].toIntOrNull() ?: 0
+                    minutes * 60 + seconds
+                }
+                3 -> {
+                    val hours = parts[0].toIntOrNull() ?: 0
+                    val minutes = parts[1].toIntOrNull() ?: 0
+                    val seconds = parts[2].toIntOrNull() ?: 0
+                    hours * 3600 + minutes * 60 + seconds
+                }
+                else -> 0
+            }
+        } catch (e: Exception) {
+            0
+        }
+    }
+
     private fun parseSearchResults(root: JsonElement): List<Song> {
         val items = root.findObjectsWithKey("musicResponsiveListItemRenderer")
         return items.mapNotNull { item ->
@@ -351,6 +386,25 @@ class InnerTubeClient {
                 }
             }
 
+            val durationRegex = Regex("""^\d+:\d{2}(:\d{2})?$""")
+            var durationText = "0:00"
+            var durationSeconds = 0
+            var foundDuration = false
+            for (i in 0 until 5) {
+                if (foundDuration) break
+                val text = item.getFlexColumnText(i) ?: continue
+                val parts = text.split(Regex(" • | •|• |•|\\u2022"))
+                for (part in parts) {
+                    val trimmed = part.trim()
+                    if (durationRegex.matches(trimmed)) {
+                        durationText = trimmed
+                        durationSeconds = parseDurationTextToSeconds(trimmed)
+                        foundDuration = true
+                        break
+                    }
+                }
+            }
+
             // Extract high-res thumbnail
             val thumbnails = item["thumbnail"]?.jsonObject
                 ?.get("musicThumbnailRenderer")?.jsonObject
@@ -370,6 +424,8 @@ class InnerTubeClient {
                 title = title,
                 artist = artist,
                 album = album,
+                durationText = durationText,
+                durationSeconds = durationSeconds,
                 thumbnailUrl = cleanThumbUrl,
                 viewsText = viewsText
             )
@@ -524,6 +580,213 @@ class InnerTubeClient {
         } catch (e: Exception) {
             Log.e("InnerTubeClient", "Failed to get artist thumbnail for $artistName: ${e.message}", e)
             null
+        }
+    }
+
+    suspend fun getLyricsBrowseId(videoId: String): String? {
+        val url = "https://music.youtube.com/youtubei/v1/next?key=$apiKey"
+        val payload = buildJsonObject {
+            put("context", buildJsonObject {
+                put("client", buildJsonObject {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", "1.20230718.01.00")
+                    put("hl", "en")
+                    put("gl", "US")
+                    if (visitorData != null) {
+                        put("visitorData", visitorData)
+                    }
+                })
+            })
+            put("videoId", videoId)
+        }
+
+        return try {
+            val response = client.post(url) {
+                contentType(ContentType.Application.Json)
+                header(HttpHeaders.UserAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                setBody(payload)
+            }
+            if (response.status == HttpStatusCode.OK) {
+                val responseBody = response.bodyAsText()
+                val jsonElement = json.parseToJsonElement(responseBody)
+                jsonElement.findLyricsBrowseId()
+            } else {
+                Log.e("InnerTubeClient", "Next endpoint response error: ${response.status}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e("InnerTubeClient", "Failed to get lyrics browseId: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun JsonElement.findLyricsBrowseId(): String? {
+        when (this) {
+            is JsonObject -> {
+                if (containsKey("browseId")) {
+                    val id = this["browseId"]?.jsonPrimitive?.content
+                    if (id != null && id.startsWith("MPLYt")) {
+                        return id
+                    }
+                }
+                for (value in values) {
+                    val found = value.findLyricsBrowseId()
+                    if (found != null) return found
+                }
+            }
+            is JsonArray -> {
+                for (item in this) {
+                    val found = item.findLyricsBrowseId()
+                    if (found != null) return found
+                }
+            }
+            else -> {}
+        }
+        return null
+    }
+
+    suspend fun getLyrics(browseId: String): String? {
+        val url = "https://music.youtube.com/youtubei/v1/browse?key=$apiKey"
+        val payload = buildJsonObject {
+            put("context", buildJsonObject {
+                put("client", buildJsonObject {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", "1.20230718.01.00")
+                    put("hl", "en")
+                    put("gl", "US")
+                    if (visitorData != null) {
+                        put("visitorData", visitorData)
+                    }
+                })
+            })
+            put("browseId", browseId)
+        }
+
+        return try {
+            val response = client.post(url) {
+                contentType(ContentType.Application.Json)
+                header(HttpHeaders.UserAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                setBody(payload)
+            }
+            if (response.status == HttpStatusCode.OK) {
+                val responseBody = response.bodyAsText()
+                val jsonElement = json.parseToJsonElement(responseBody)
+                val shelfList = jsonElement.findObjectsWithKey("musicDescriptionShelfRenderer")
+                if (shelfList.isNotEmpty()) {
+                    val shelf = shelfList[0]
+                    val runs = shelf["description"]?.jsonObject?.get("runs")?.jsonArray
+                    val lyricsText = runs?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.content }?.joinToString("")
+                    
+                    val footerRuns = shelf["footer"]?.jsonObject?.get("runs")?.jsonArray
+                    val footerText = footerRuns?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.content }?.joinToString("")
+                    
+                    if (!footerText.isNullOrBlank()) {
+                        lyricsText + "\n\n" + footerText
+                    } else {
+                        lyricsText
+                    }
+                } else {
+                    null
+                }
+            } else {
+                Log.e("InnerTubeClient", "Browse endpoint response error: ${response.status}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e("InnerTubeClient", "Failed to get lyrics: ${e.message}", e)
+            null
+        }
+    }
+
+    private suspend fun getLrcLyricsInternal(url: String, trackName: String, artistName: String, durationSeconds: Int): String? {
+        Log.i("InnerTubeClient", "getLrcLyricsInternal: url=$url, trackName='$trackName', artistName='$artistName', durationSeconds=$durationSeconds")
+        return try {
+            val response = kotlinx.coroutines.withTimeoutOrNull(15000) {
+                client.get(url) {
+                    parameter("track_name", trackName)
+                    parameter("artist_name", artistName)
+                    if (durationSeconds > 0) {
+                        parameter("duration", durationSeconds)
+                    }
+                    header(HttpHeaders.UserAgent, "ConveneMusic/1.0 (https://github.com/adrish-paul/Convene-Music)")
+                }
+            }
+            if (response != null) {
+                Log.i("InnerTubeClient", "getLrcLyricsInternal: Received response status=${response.status}")
+                if (response.status == HttpStatusCode.OK) {
+                    val responseBody = response.bodyAsText()
+                    val jsonElement = json.parseToJsonElement(responseBody)
+                    val synced = jsonElement.jsonObject["syncedLyrics"]?.jsonPrimitive?.content
+                    if (!synced.isNullOrBlank()) {
+                        Log.i("InnerTubeClient", "getLrcLyricsInternal: Found synced lyrics (length=${synced.length})")
+                        synced
+                    } else {
+                        val plain = jsonElement.jsonObject["plainLyrics"]?.jsonPrimitive?.content
+                        Log.i("InnerTubeClient", "getLrcLyricsInternal: Synced lyrics null/blank, found plain lyrics (length=${plain?.length ?: 0})")
+                        plain
+                    }
+                } else {
+                    Log.e("InnerTubeClient", "getLrcLyricsInternal: LRCLib returned status ${response.status} for duration=$durationSeconds")
+                    null
+                }
+            } else {
+                Log.e("InnerTubeClient", "getLrcLyricsInternal: Query timed out (15000ms) for duration=$durationSeconds")
+                null
+            }
+        } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) {
+                Log.w("InnerTubeClient", "getLrcLyricsInternal: Coroutine cancelled for duration=$durationSeconds")
+                throw e
+            }
+            Log.e("InnerTubeClient", "getLrcLyricsInternal: Failed to fetch from LRCLib for duration=$durationSeconds", e)
+            null
+        }
+    }
+
+    suspend fun getLrcLyrics(trackName: String, artistName: String, durationSeconds: Int): String? {
+        val url = "https://lrclib.net/api/get"
+        if (durationSeconds > 0) {
+            Log.i("InnerTubeClient", "getLrcLyrics: Querying LRCLib with duration=$durationSeconds for '$trackName' by '$artistName'")
+            val result = getLrcLyricsInternal(url, trackName, artistName, durationSeconds)
+            if (result != null) return result
+            Log.i("InnerTubeClient", "getLrcLyrics: LRCLib query with duration failed/timed out, retrying WITHOUT duration")
+        }
+        Log.i("InnerTubeClient", "getLrcLyrics: Querying LRCLib without duration for '$trackName' by '$artistName'")
+        return getLrcLyricsInternal(url, trackName, artistName, 0)
+    }
+
+
+    fun parseLyricsText(lyricsText: String): LyricsData {
+        val lines = lyricsText.split("\n")
+        val result = mutableListOf<LyricLine>()
+        val regex = Regex("""^\[(\d+):(\d{2})(?:[.:](\d{1,3}))?\](.*)""")
+        var isSynced = false
+        
+        for (line in lines) {
+            val trimmed = line.trim()
+            val match = regex.find(trimmed)
+            if (match != null) {
+                isSynced = true
+                val min = match.groupValues[1].toLongOrNull() ?: 0L
+                val sec = match.groupValues[2].toLongOrNull() ?: 0L
+                val msStr = match.groupValues[3]
+                var ms = msStr.toLongOrNull() ?: 0L
+                if (msStr.length == 2) {
+                    ms *= 10
+                } else if (msStr.length == 1) {
+                    ms *= 100
+                }
+                val text = match.groupValues[4].trim()
+                val timeMs = min * 60000 + sec * 1000 + ms
+                result.add(LyricLine(timeMs, text))
+            }
+        }
+        
+        return if (isSynced) {
+            LyricsData(isSynced = true, lines = result.sortedBy { it.timestampMs })
+        } else {
+            val plainLines = lines.map { LyricLine(-1L, it.trim()) }
+            LyricsData(isSynced = false, lines = plainLines)
         }
     }
 }

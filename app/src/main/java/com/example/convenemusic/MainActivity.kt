@@ -23,20 +23,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val permsNeeded = mutableListOf<String>()
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
-                permsNeeded.add(Manifest.permission.POST_NOTIFICATIONS)
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED)
-                permsNeeded.add(Manifest.permission.READ_MEDIA_AUDIO)
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED)
-                permsNeeded.add(Manifest.permission.READ_MEDIA_VIDEO)
-            if (permsNeeded.isNotEmpty())
-                ActivityCompat.requestPermissions(this, permsNeeded.toTypedArray(), 101)
-        } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 102)
-        }
+
 
         enableEdgeToEdge()
         setContent {

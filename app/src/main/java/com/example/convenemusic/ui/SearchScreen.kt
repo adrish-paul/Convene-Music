@@ -41,12 +41,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.Measurable
+import androidx.compose.ui.layout.Placeable
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -57,8 +66,24 @@ import coil3.compose.AsyncImage
 import com.example.convenemusic.network.Song
 import com.example.convenemusic.network.Playlist
 import com.example.convenemusic.ui.components.SquigglyProgressBar
+import com.example.convenemusic.ui.components.RetroCassetteTape
 import com.example.convenemusic.ui.theme.UIColors
 import com.example.convenemusic.ui.theme.LocalUIColors
+import dev.chrisbanes.haze.ExperimentalHazeApi
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
+import dev.chrisbanes.haze.materials.HazeMaterials
+import dev.chrisbanes.haze.rememberHazeState
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -66,7 +91,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 private fun splitArtistNames(combinedName: String): List<String> {
     val bulletParts = combinedName.split(Regex(" • | •|• |•|\\u2022"))
     val mainArtistPart = bulletParts.firstOrNull()?.trim() ?: combinedName
-    val separators = Regex(",|/|\\||&|\\s+\\.\\s+|\\bx\\b|\\bX\\b|\\band\\b|\\bfeat\\.?\\b|\\bft\\.?\\b", RegexOption.IGNORE_CASE)
+    val separators = Regex(",|/|\\||&|\\s+\\.\\s+|\\bx\\b|\\bX\\b|\\band\\b|\\bfeat(?:\\.|\\b)|\\bft(?:\\.|\\b)", RegexOption.IGNORE_CASE)
     return mainArtistPart.split(separators)
         .map { it.trim() }
         .filter { it.isNotEmpty() && !it.equals("unknown", ignoreCase = true) }
@@ -80,7 +105,16 @@ fun SearchScreen(
     onSegmentChange: (String) -> Unit,
     activePlaylist: Playlist?,
     onActivePlaylistChange: (Playlist?) -> Unit,
+    activeArtist: String?,
+    onActiveArtistChange: (String?) -> Unit,
+    activeGenre: String?,
+    onActiveGenreChange: (String?) -> Unit,
+    viewAllGenres: Boolean,
+    onViewAllGenresChange: (Boolean) -> Unit,
+    viewAllArtists: Boolean,
+    onViewAllArtistsChange: (Boolean) -> Unit,
     onSongSelect: (Song) -> Unit,
+    onPlaySongWithoutNavigation: (Song) -> Unit = {},
     onPlayPlaylist: (Playlist) -> Unit,
     searchSongs: List<Song>,
     playlistResults: List<Playlist>,
@@ -99,6 +133,7 @@ fun SearchScreen(
     onLoadMore: () -> Unit,
     isLoading: Boolean,
     isPlaylistLoading: Boolean,
+    searchFocusTrigger: Boolean = false,
     modifier: Modifier = Modifier,
     isLoadMoreLoading: Boolean = false,
     isPlayerOpen: Boolean = false,
@@ -107,10 +142,36 @@ fun SearchScreen(
     isGenreLoading: Boolean = false,
     onLoadGenreTracks: (String) -> Unit = {},
     onClearGenreTracks: () -> Unit = {},
-    onLoadMoreGenreTracks: (String) -> Unit = {}
+    onLoadMoreGenreTracks: (String) -> Unit = {},
+    onLoadArtistThumbnail: (String) -> Unit = {},
+    isPlaying: Boolean = false,
+    currentSong: Song? = null,
+    onPlayPauseClick: () -> Unit = {},
+    loopMode: Int = 0,
+    shuffleEnabled: Boolean = false,
+    onLoopModeToggle: () -> Unit = {},
+    onShuffleToggle: () -> Unit = {},
+    onNextClick: () -> Unit = {},
+    onPreviousClick: () -> Unit = {}
 ) {
     val uiColors = LocalUIColors.current
     val focusManager = LocalFocusManager.current
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val isFirstRun = remember { mutableStateOf(true) }
+
+    LaunchedEffect(searchFocusTrigger) {
+        if (isFirstRun.value) {
+            isFirstRun.value = false
+        } else {
+            try {
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
 
     val songListState = rememberLazyListState()
     val playlistListState = rememberLazyListState()
@@ -143,19 +204,15 @@ fun SearchScreen(
         }
     }
 
-    var activeArtist by remember { mutableStateOf<String?>(null) }
     val EmphasizedEasing = CubicBezierEasing(0.2f, 0f, 0f, 1f)
     val transitionProgress = remember { Animatable(0f) }
     var activeArtistState by remember { mutableStateOf<String?>(null) }
 
-    var activeGenre by remember { mutableStateOf<String?>(null) }
-    var viewAllGenres by remember { mutableStateOf(false) }
     val viewAllTransitionProgress = remember { Animatable(0f) }
     val genreDetailTransitionProgress = remember { Animatable(0f) }
     var activeGenreState by remember { mutableStateOf<String?>(null) }
     var viewAllGenresState by remember { mutableStateOf(false) }
 
-    var viewAllArtists by remember { mutableStateOf(false) }
     val viewAllArtistsTransitionProgress = remember { Animatable(0f) }
     var viewAllArtistsState by remember { mutableStateOf(false) }
 
@@ -232,7 +289,7 @@ fun SearchScreen(
                 targetValue = 0f,
                 animationSpec = spring(stiffness = Spring.StiffnessMedium)
             )
-            activeArtist = null
+            onActiveArtistChange(null)
             activeArtistState = null
         } catch (e: CancellationException) {
             transitionProgress.animateTo(
@@ -251,7 +308,7 @@ fun SearchScreen(
                 targetValue = 0f,
                 animationSpec = spring(stiffness = Spring.StiffnessMedium)
             )
-            activeGenre = null
+            onActiveGenreChange(null)
             activeGenreState = null
             onClearGenreTracks()
         } catch (e: CancellationException) {
@@ -271,7 +328,7 @@ fun SearchScreen(
                 targetValue = 0f,
                 animationSpec = spring(stiffness = Spring.StiffnessMedium)
             )
-            viewAllGenres = false
+            onViewAllGenresChange(false)
             viewAllGenresState = false
         } catch (e: CancellationException) {
             viewAllTransitionProgress.animateTo(
@@ -290,7 +347,7 @@ fun SearchScreen(
                 targetValue = 0f,
                 animationSpec = spring(stiffness = Spring.StiffnessMedium)
             )
-            viewAllArtists = false
+            onViewAllArtistsChange(false)
             viewAllArtistsState = false
         } catch (e: CancellationException) {
             viewAllArtistsTransitionProgress.animateTo(
@@ -351,18 +408,26 @@ fun SearchScreen(
             playlist = activePlaylist,
             tracks = playlistTracks,
             isLoading = isPlaylistLoading,
+            isPlaying = isPlaying && playlistTracks.any { it.id == currentSong?.id },
+            currentSong = currentSong,
             onBackClick = { onActivePlaylistChange(null) },
             onSongSelect = { song ->
                 focusManager.clearFocus()
                 onSongSelect(song)
             },
+            onPlaySongWithoutNavigation = onPlaySongWithoutNavigation,
+            onPlayPauseClick = onPlayPauseClick,
             onRefresh = { onLoadPlaylistTracks(activePlaylist.id) },
             uiColors = uiColors,
-            modifier = modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .background(uiColors.background)
-                .padding(horizontal = 16.dp)
+            loopMode = loopMode,
+            shuffleEnabled = shuffleEnabled,
+            onLoopModeToggle = onLoopModeToggle,
+            onShuffleToggle = onShuffleToggle,
+            onNextClick = onNextClick,
+            onPreviousClick = onPreviousClick,
+            artistThumbnails = artistThumbnails,
+            onLoadArtistThumbnail = onLoadArtistThumbnail,
+            modifier = modifier.fillMaxSize()
         )
     } else {
         Box(modifier = modifier.fillMaxSize()) {
@@ -396,7 +461,7 @@ fun SearchScreen(
 
                     // Search Header Title
                     Text(
-                        text = "Convene Music",
+                        text = "Convene",
                         color = uiColors.textPrimary,
                         fontSize = 28.sp,
                         fontWeight = FontWeight.ExtraBold,
@@ -451,7 +516,9 @@ fun SearchScreen(
                                     fontSize = 14.sp
                                 ),
                                 cursorBrush = androidx.compose.ui.graphics.SolidColor(uiColors.progressAccent),
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .focusRequester(focusRequester)
                             )
                         }
                         if (query.isNotEmpty()) {
@@ -624,7 +691,7 @@ fun SearchScreen(
                                                             ViewAllGenreCard(
                                                                 onClick = {
                                                                     focusManager.clearFocus()
-                                                                    viewAllGenres = true
+                                                                    onViewAllGenresChange(true)
                                                                 },
                                                                 uiColors = uiColors
                                                             )
@@ -633,7 +700,7 @@ fun SearchScreen(
                                                                 genreName = item,
                                                                 onClick = {
                                                                     focusManager.clearFocus()
-                                                                    activeGenre = item
+                                                                    onActiveGenreChange(item)
                                                                     onLoadGenreTracks(item)
                                                                 },
                                                                 onPlayClick = null,
@@ -671,7 +738,7 @@ fun SearchScreen(
                                                             ViewAllGenreCard(
                                                                 onClick = {
                                                                     focusManager.clearFocus()
-                                                                    viewAllArtists = true
+                                                                    onViewAllArtistsChange(true)
                                                                 },
                                                                 uiColors = uiColors
                                                             )
@@ -680,10 +747,11 @@ fun SearchScreen(
                                                                 artistName = artistName,
                                                                 onClick = {
                                                                     focusManager.clearFocus()
-                                                                    activeArtist = artistName
+                                                                    onActiveArtistChange(artistName)
                                                                 },
                                                                 thumbnailUrl = artistThumbnails[artistName],
-                                                                uiColors = uiColors
+                                                                uiColors = uiColors,
+                                                                onLoadThumbnail = onLoadArtistThumbnail
                                                             )
                                                         }
                                                     }
@@ -719,21 +787,43 @@ fun SearchScreen(
                                     val matchedArtists = remember(searchSongs, query, artistThumbnails) {
                                         if (query.isBlank()) emptyList()
                                         else {
-                                            searchSongs
+                                            val artistNames = searchSongs
                                                 .flatMap { splitArtistNames(it.artist) }
                                                 .filter { it.contains(query, ignoreCase = true) }
-                                                .distinctBy { it.lowercase().trim() }
-                                                .map { artistName ->
-                                                    val officialThumb = artistThumbnails[artistName]
-                                                    if (officialThumb != null) {
-                                                        artistName to officialThumb
-                                                    } else {
-                                                        val firstSong = searchSongs.firstOrNull { song ->
-                                                            splitArtistNames(song.artist).any { it.equals(artistName, ignoreCase = true) }
-                                                        }
-                                                        artistName to firstSong?.thumbnailUrl
-                                                    }
+                                                .map { it.trim() }
+                                                .distinctBy { it.lowercase() }
+
+                                            val sortedNames = artistNames.sortedBy { it.length }
+                                            val uniqueArtists = mutableListOf<String>()
+
+                                            for (name in sortedNames) {
+                                                val lowerName = name.lowercase()
+                                                val isDuplicate = uniqueArtists.any { existing ->
+                                                    val lowerExisting = existing.lowercase()
+                                                    lowerName.startsWith(lowerExisting) && (
+                                                        lowerName.length == lowerExisting.length ||
+                                                        lowerName[lowerExisting.length] == ' ' ||
+                                                        lowerName[lowerExisting.length] == '-' ||
+                                                        lowerName.substring(lowerExisting.length).contains("the first take", ignoreCase = true) ||
+                                                        lowerName.substring(lowerExisting.length).contains("- topic", ignoreCase = true)
+                                                    )
                                                 }
+                                                if (!isDuplicate) {
+                                                    uniqueArtists.add(name)
+                                                }
+                                            }
+
+                                            uniqueArtists.map { artistName ->
+                                                val officialThumb = artistThumbnails[artistName]
+                                                if (officialThumb != null) {
+                                                    artistName to officialThumb
+                                                } else {
+                                                    val firstSong = searchSongs.firstOrNull { song ->
+                                                        splitArtistNames(song.artist).any { it.equals(artistName, ignoreCase = true) }
+                                                    }
+                                                    artistName to firstSong?.thumbnailUrl
+                                                }
+                                            }
                                         }
                                     }
 
@@ -767,7 +857,7 @@ fun SearchScreen(
                                                                 thumbnailUrl = thumbnailUrl,
                                                                 onClick = {
                                                                     focusManager.clearFocus()
-                                                                    activeArtist = artistName
+                                                                    onActiveArtistChange(artistName)
                                                                 },
                                                                 uiColors = uiColors
                                                             )
@@ -855,9 +945,9 @@ fun SearchScreen(
                 )
                 ViewAllGenresView(
                     genres = allGenresList,
-                    onBackClick = { viewAllGenres = false },
+                    onBackClick = { onViewAllGenresChange(false) },
                     onGenreClick = { genre ->
-                        activeGenre = genre
+                        onActiveGenreChange(genre)
                         onLoadGenreTracks(genre)
                     },
                     uiColors = uiColors,
@@ -884,9 +974,9 @@ fun SearchScreen(
                 ViewAllArtistsView(
                     artists = famousArtistsList,
                     artistThumbnails = artistThumbnails,
-                    onBackClick = { viewAllArtists = false },
+                    onBackClick = { onViewAllArtistsChange(false) },
                     onArtistClick = { artistName ->
-                        activeArtist = artistName
+                        onActiveArtistChange(artistName)
                     },
                     uiColors = uiColors,
                     modifier = Modifier
@@ -901,7 +991,8 @@ fun SearchScreen(
                         .shadow(8.dp, clip = false)
                         .background(uiColors.background)
                         .statusBarsPadding()
-                        .padding(horizontal = 16.dp)
+                        .padding(horizontal = 16.dp),
+                    onLoadArtistThumbnail = onLoadArtistThumbnail
                 )
             }
 
@@ -911,17 +1002,25 @@ fun SearchScreen(
                     genreName = currentGenre,
                     tracks = genreTracks,
                     isLoading = isGenreLoading,
+                    isPlaying = isPlaying && genreTracks.isNotEmpty() && genreTracks.any { it.id == currentSong?.id },
+                    currentSong = currentSong,
                     onBackClick = {
-                        activeGenre = null
+                        onActiveGenreChange(null)
                         onClearGenreTracks()
                     },
                     onSongSelect = { song ->
                         focusManager.clearFocus()
                         onSongSelect(song)
                     },
+                    onPlaySongWithoutNavigation = onPlaySongWithoutNavigation,
+                    onPlayPauseClick = onPlayPauseClick,
+                    onNextClick = onNextClick,
+                    onPreviousClick = onPreviousClick,
                     onRefresh = { onLoadGenreTracks(currentGenre) },
                     onLoadMore = { onLoadMoreGenreTracks(currentGenre) },
                     uiColors = uiColors,
+                    artistThumbnails = artistThumbnails,
+                    onLoadArtistThumbnail = onLoadArtistThumbnail,
                     modifier = Modifier
                         .fillMaxSize()
                         .offset {
@@ -931,9 +1030,6 @@ fun SearchScreen(
                             )
                         }
                         .shadow(8.dp, clip = false)
-                        .background(uiColors.background)
-                        .statusBarsPadding()
-                        .padding(horizontal = 16.dp)
                 )
             }
 
@@ -944,11 +1040,17 @@ fun SearchScreen(
                     artistName = currentArtist,
                     tracks = artistTracks,
                     isLoading = isArtistLoading,
-                    onBackClick = { activeArtist = null },
+                    isPlaying = isPlaying && artistTracks.isNotEmpty() && artistTracks.any { it.id == currentSong?.id },
+                    currentSong = currentSong,
+                    onBackClick = { onActiveArtistChange(null) },
                     onSongSelect = { song ->
                         focusManager.clearFocus()
                         onSongSelect(song)
                     },
+                    onPlaySongWithoutNavigation = onPlaySongWithoutNavigation,
+                    onPlayPauseClick = onPlayPauseClick,
+                    onNextClick = onNextClick,
+                    onPreviousClick = onPreviousClick,
                     onRefresh = { onLoadArtistTracks(currentArtist) },
                     onLoadMore = { onLoadMoreArtistTracks(currentArtist) },
                     uiColors = uiColors,
@@ -962,9 +1064,6 @@ fun SearchScreen(
                             )
                         }
                         .shadow(16.dp, clip = false)
-                        .background(uiColors.background)
-                        .statusBarsPadding()
-                        .padding(horizontal = 16.dp)
                 )
             }
         }
@@ -972,17 +1071,46 @@ fun SearchScreen(
 }
 
 @Composable
+@OptIn(ExperimentalHazeMaterialsApi::class, ExperimentalHazeApi::class)
 fun TrackStandingCard(
     song: Song,
     onClick: () -> Unit,
-    uiColors: UIColors
+    uiColors: UIColors,
+    hazeState: HazeState? = null
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(20.dp))
-            .background(uiColors.cardBackground, shape = RoundedCornerShape(20.dp))
-            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(20.dp))
+            .then(
+                if (hazeState != null) {
+                    Modifier.hazeEffect(
+                        state = hazeState,
+                        style = HazeMaterials.thin()
+                    ) {
+                        blurRadius = 24.dp
+                        noiseFactor = 0.02f
+                        alpha = 0.9f
+                    }
+                } else Modifier
+            )
+            .background(
+                if (hazeState != null) Color.White.copy(alpha = 0.08f)
+                else uiColors.cardBackground,
+                shape = RoundedCornerShape(20.dp)
+            )
+            .border(
+                width = 1.dp,
+                brush = if (hazeState != null) {
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.25f),
+                            Color.White.copy(alpha = 0.06f)
+                        )
+                    )
+                } else Brush.linearGradient(colors = listOf(uiColors.cardBorder, uiColors.cardBorder)),
+                shape = RoundedCornerShape(20.dp)
+            )
             .clickable { onClick() }
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -1002,14 +1130,23 @@ fun TrackStandingCard(
         Column(
             modifier = Modifier.weight(1f)
         ) {
-            Text(
-                text = song.title,
-                color = uiColors.textPrimary,
-                fontWeight = FontWeight.Bold,
-                fontSize = 15.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = song.title,
+                    color = if (hazeState != null) Color.White else uiColors.textPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (song.id.startsWith("/")) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    BadgeCapsule(text = "Preview", uiColors = uiColors)
+                }
+            }
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
@@ -1017,26 +1154,10 @@ fun TrackStandingCard(
                     "${song.artist} • ${song.album}"
                 else
                     song.artist,
-                color = uiColors.textSecondary,
+                color = if (hazeState != null) Color.White.copy(alpha = 0.65f) else uiColors.textSecondary,
                 fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
-            )
-        }
-
-        Spacer(modifier = Modifier.width(8.dp))
-
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .background(uiColors.cardBorder, shape = CircleShape),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Default.PlayArrow,
-                contentDescription = "Play",
-                tint = uiColors.textPrimary,
-                modifier = Modifier.size(16.dp)
             )
         }
     }
@@ -1124,219 +1245,326 @@ fun PlaylistStandingCard(
 }
 
 @Composable
+fun Modifier.heightPx(heightPxProvider: () -> Int) = this.layout { measurable, constraints ->
+    val height = heightPxProvider()
+    val placeable = measurable.measure(constraints.copy(
+        minHeight = height,
+        maxHeight = height
+    ))
+    layout(placeable.width, height) {
+        placeable.placeRelative(0, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared slideshow background used by Playlist, Genre, and Custom Playlist
+// ---------------------------------------------------------------------------
+
+/** Returns up to [max] unique artist thumbnail URLs from the given tracks, shuffled. */
+fun getPlaylistSlideshowUrls(
+    tracks: List<Song>,
+    artistThumbnails: Map<String, String>,
+    max: Int = 20
+): List<String> {
+    val seen = mutableSetOf<String>()
+    val urls = mutableListOf<String>()
+    for (song in tracks) {
+        val artist = song.artist.trim()
+        if (artist.isNotEmpty() && seen.add(artist)) {
+            val url = artistThumbnails[artist]
+            if (!url.isNullOrBlank()) urls.add(url)
+        }
+        if (urls.size >= max) break
+    }
+    return urls.shuffled()
+}
+
+@OptIn(ExperimentalHazeMaterialsApi::class, ExperimentalHazeApi::class)
+@Composable
+fun ArtistPhotoSlideshowBackground(
+    imageUrls: List<String>,
+    hazeState: HazeState,
+    uiColors: UIColors
+) {
+    if (imageUrls.isEmpty()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(uiColors.background)
+                .hazeSource(hazeState)
+        )
+        return
+    }
+
+    var currentIndex by remember { mutableStateOf(0) }
+
+    LaunchedEffect(imageUrls) {
+        if (currentIndex >= imageUrls.size) {
+            currentIndex = 0
+        }
+        while (true) {
+            delay(10000)
+            currentIndex = if (imageUrls.isNotEmpty()) (currentIndex + 1) % imageUrls.size else 0
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .hazeSource(hazeState)
+    ) {
+        val safeIndex = if (currentIndex in imageUrls.indices) currentIndex else 0
+        AnimatedContent(
+            targetState = safeIndex,
+            transitionSpec = {
+                fadeIn(tween(800)) togetherWith fadeOut(tween(800))
+            },
+            label = "slideshow",
+            modifier = Modifier.fillMaxSize()
+        ) { idx ->
+            val url = imageUrls.getOrNull(idx) ?: ""
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (url.isNotEmpty()) {
+                    AsyncImage(
+                        model = url,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+        }
+
+        // Dark gradient scrim
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Black.copy(alpha = 0.50f),
+                            Color.Black.copy(alpha = 0.72f),
+                            Color.Black.copy(alpha = 0.82f)
+                        )
+                    )
+                )
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+@OptIn(ExperimentalHazeMaterialsApi::class, ExperimentalHazeApi::class)
+@Composable
 fun PlaylistDetailView(
     playlist: Playlist,
     tracks: List<Song>,
     isLoading: Boolean,
+    isPlaying: Boolean,
+    currentSong: Song?,
     onBackClick: () -> Unit,
     onSongSelect: (Song) -> Unit,
+    onPlaySongWithoutNavigation: (Song) -> Unit = {},
+    onPlayPauseClick: () -> Unit,
     onRefresh: () -> Unit,
     uiColors: UIColors,
+    loopMode: Int = 0,
+    shuffleEnabled: Boolean = false,
+    onLoopModeToggle: () -> Unit = {},
+    onShuffleToggle: () -> Unit = {},
+    onNextClick: () -> Unit = {},
+    onPreviousClick: () -> Unit = {},
+    artistThumbnails: Map<String, String> = emptyMap(),
+    onLoadArtistThumbnail: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    Column(
+    val lazyListState = rememberLazyListState()
+    val hazeState = rememberHazeState()
+    val density = LocalDensity.current
+    val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+
+    LaunchedEffect(tracks) {
+        val seen = mutableSetOf<String>()
+        val uniqueArtists = mutableListOf<String>()
+        for (song in tracks) {
+            val artist = song.artist.trim()
+            if (artist.isNotEmpty() && seen.add(artist)) {
+                uniqueArtists.add(artist)
+            }
+            if (uniqueArtists.size >= 20) break
+        }
+        uniqueArtists.forEachIndexed { index, artistName ->
+            if (index > 0) {
+                delay(3000)
+            }
+            onLoadArtistThumbnail(artistName)
+        }
+    }
+
+    val slideshowUrls = remember(tracks, artistThumbnails) {
+        getPlaylistSlideshowUrls(tracks, artistThumbnails)
+    }
+    val hasBackground = slideshowUrls.isNotEmpty()
+
+    val titleAlpha = remember {
+        derivedStateOf {
+            if (lazyListState.firstVisibleItemIndex > 0) {
+                1f
+            } else {
+                val offset = lazyListState.firstVisibleItemScrollOffset.toFloat()
+                val fadeRangePx = with(density) { 120.dp.toPx() }
+                (offset / fadeRangePx).coerceIn(0f, 1f)
+            }
+        }
+    }
+
+    Box(
         modifier = modifier
+            .fillMaxSize()
+            .clipToBounds()
     ) {
+        // Photo slideshow or fallback background
+        ArtistPhotoSlideshowBackground(
+            imageUrls = slideshowUrls,
+            hazeState = hazeState,
+            uiColors = uiColors
+        )
+
+        PullToRefreshContainer(
+            isRefreshing = isLoading,
+            onRefresh = onRefresh,
+            accentColor = uiColors.progressAccent,
+            backgroundColor = Color.Transparent,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            LazyColumn(
+                state = lazyListState,
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .align(Alignment.TopCenter),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(top = statusBarHeight + 64.dp, bottom = 100.dp)
+            ) {
+                item {
+                    val trackCount = remember(playlist.songCountText, tracks) {
+                        playlist.songCountText?.filter { it.isDigit() }?.toIntOrNull() ?: tracks.size
+                    }
+                    RetroCassetteTape(
+                        title = playlist.title,
+                        author = playlist.author ?: "Unknown",
+                        trackCount = trackCount,
+                        isPlaying = isPlaying,
+                        uiColors = uiColors,
+                        showControls = true,
+                        shuffleEnabled = shuffleEnabled,
+                        loopMode = loopMode,
+                        onShuffleClick = onShuffleToggle,
+                        onLoopClick = onLoopModeToggle,
+                        onNextClick = onNextClick,
+                        onPreviousClick = onPreviousClick,
+                        onPlayClick = {
+                            if (tracks.isNotEmpty()) {
+                                val isCurrentLoaded = currentSong != null && tracks.any { it.id == currentSong.id }
+                                if (isCurrentLoaded) onPlayPauseClick()
+                                else onPlaySongWithoutNavigation(tracks.first())
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                if (isLoading && tracks.isEmpty()) {
+                    item {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 40.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "Loading tracks...",
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(bottom = 16.dp)
+                                )
+                                SquigglyProgressBar(
+                                    progress = null,
+                                    color = uiColors.progressAccent,
+                                    trackColor = uiColors.cardBorder,
+                                    animated = true,
+                                    animationSpeed = 700,
+                                    modifier = Modifier.fillMaxWidth(0.6f).height(16.dp)
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    if (isLoading) {
+                        item {
+                            SquigglyProgressBar(
+                                progress = null,
+                                color = uiColors.progressAccent,
+                                trackColor = uiColors.cardBorder,
+                                wavelength = 56.dp,
+                                amplitude = 5.dp,
+                                strokeWidth = 3.dp,
+                                animated = true,
+                                animationSpeed = 700,
+                                modifier = Modifier.fillMaxWidth().height(14.dp).padding(vertical = 4.dp)
+                            )
+                        }
+                    }
+                    items(tracks) { song ->
+                        TrackStandingCard(
+                            song = song,
+                            onClick = { onSongSelect(song) },
+                            uiColors = uiColors,
+                            hazeState = if (hasBackground) hazeState else null
+                        )
+                    }
+                    item { Spacer(modifier = Modifier.height(80.dp)) }
+                }
+            }
+        }
+
+        // Pinned action bar — fully transparent
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
+                .statusBarsPadding()
+                .height(56.dp)
+                .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(uiColors.cardBackground, shape = CircleShape)
-                    .border(1.dp, uiColors.cardBorder, CircleShape)
+                    .background(Color.Black.copy(alpha = 0.35f), shape = CircleShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape)
                     .clickable { onBackClick() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.ArrowBackIosNew,
                     contentDescription = "Back",
-                    tint = uiColors.textPrimary,
+                    tint = Color.White,
                     modifier = Modifier.size(16.dp)
                 )
             }
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "Playlist Details",
-                color = uiColors.textPrimary,
+                text = playlist.title,
+                color = Color.White,
                 fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .basicMarquee()
+                    .graphicsLayer { alpha = titleAlpha.value }
             )
         }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(146.dp)
-                .background(uiColors.cardBackground, shape = RoundedCornerShape(24.dp))
-                .border(1.dp, uiColors.cardBorder, RoundedCornerShape(24.dp))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 18.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                AsyncImage(
-                    model = playlist.thumbnailUrl,
-                    contentDescription = "Playlist Art",
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(110.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color.LightGray)
-                )
-                Spacer(modifier = Modifier.width(18.dp))
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = playlist.title,
-                        color = uiColors.textPrimary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Created by ${playlist.author}",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    playlist.songCountText?.let {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        BadgeCapsule(text = it, uiColors = uiColors)
-                    }
-                }
-            }
-
-            if (tracks.isNotEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(bottom = 12.dp, end = 12.dp)
-                        .size(44.dp)
-                        .background(uiColors.progressAccent, shape = CircleShape)
-                        .clickable { onSongSelect(tracks.first()) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Play All",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        if (isLoading && tracks.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = "Loading tracks...",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(bottom = 16.dp)
-                    )
-                    SquigglyProgressBar(
-                        progress = null,
-                        color = uiColors.progressAccent,
-                        trackColor = uiColors.cardBorder,
-                        animated = true,
-                        animationSpeed = 700,
-                        modifier = Modifier
-                            .fillMaxWidth(0.6f)
-                            .height(16.dp)
-                    )
-                }
-            }
-        } else {
-            PullToRefreshContainer(
-                isRefreshing = isLoading,
-                onRefresh = onRefresh,
-                accentColor = uiColors.progressAccent,
-                backgroundColor = uiColors.cardBackground,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    if (isLoading) {
-                        SquigglyProgressBar(
-                            progress = null,
-                            color = uiColors.progressAccent,
-                            trackColor = uiColors.cardBorder,
-                            wavelength = 56.dp,
-                            amplitude = 5.dp,
-                            strokeWidth = 3.dp,
-                            animated = true,
-                            animationSpeed = 700,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(14.dp)
-                                .padding(vertical = 4.dp, horizontal = 16.dp)
-                        )
-                    }
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .align(Alignment.CenterHorizontally)
-                            .weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = 100.dp)
-                    ) {
-                        items(tracks) { song ->
-                            TrackStandingCard(
-                                song = song,
-                                onClick = { onSongSelect(song) },
-                                uiColors = uiColors
-                            )
-                        }
-                        item {
-                            Spacer(modifier = Modifier.height(80.dp))
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun BadgeCapsule(text: String, uiColors: UIColors) {
-    Box(
-        modifier = Modifier
-            .background(uiColors.cardBorder, shape = RoundedCornerShape(8.dp))
-            .border(0.5.dp, uiColors.cardBorder, RoundedCornerShape(8.dp))
-            .padding(horizontal = 6.dp, vertical = 2.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = text,
-            color = uiColors.textSecondary,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold
-        )
     }
 }
 
@@ -1421,13 +1649,20 @@ fun ArtistCard(
     }
 }
 
+@OptIn(ExperimentalHazeMaterialsApi::class, ExperimentalHazeApi::class)
 @Composable
 fun ArtistDetailView(
     artistName: String,
     tracks: List<Song>,
     isLoading: Boolean,
+    isPlaying: Boolean,
+    currentSong: Song?,
     onBackClick: () -> Unit,
     onSongSelect: (Song) -> Unit,
+    onPlaySongWithoutNavigation: (Song) -> Unit = {},
+    onPlayPauseClick: () -> Unit,
+    onNextClick: () -> Unit = {},
+    onPreviousClick: () -> Unit = {},
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     uiColors: UIColors,
@@ -1435,6 +1670,7 @@ fun ArtistDetailView(
     modifier: Modifier = Modifier
 ) {
     val artistListState = rememberLazyListState()
+    val hazeState = rememberHazeState()
 
     val shouldLoadMoreArtist by remember {
         derivedStateOf {
@@ -1450,207 +1686,205 @@ fun ArtistDetailView(
         }
     }
 
-    Column(
+    val density = LocalDensity.current
+
+    val titleAlpha = remember {
+        derivedStateOf {
+            if (artistListState.firstVisibleItemIndex > 0) {
+                1f
+            } else {
+                val offset = artistListState.firstVisibleItemScrollOffset.toFloat()
+                val fadeRangePx = with(density) { 120.dp.toPx() }
+                (offset / fadeRangePx).coerceIn(0f, 1f)
+            }
+        }
+    }
+
+    Box(
         modifier = modifier
+            .fillMaxSize()
+            .clipToBounds()
     ) {
+        // Artist photo background with dark scrim — this is the hazeSource
+        if (!artistThumbnailUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = artistThumbnailUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .hazeSource(hazeState)
+            )
+            // Dark gradient scrim for readability
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color.Black.copy(alpha = 0.50f),
+                                Color.Black.copy(alpha = 0.72f),
+                                Color.Black.copy(alpha = 0.82f)
+                            )
+                        )
+                    )
+            )
+        } else {
+            // Fallback solid background — also act as hazeSource
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(uiColors.background)
+                    .hazeSource(hazeState)
+            )
+        }
+
+        PullToRefreshContainer(
+            isRefreshing = isLoading,
+            onRefresh = onRefresh,
+            accentColor = uiColors.progressAccent,
+            backgroundColor = Color.Transparent,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+            LazyColumn(
+                state = artistListState,
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .align(Alignment.TopCenter),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(top = statusBarHeight + 64.dp, bottom = 100.dp),
+            ) {
+                // Stagnant Cassette Tape Header — no spacers, fullscreen
+                item {
+                    RetroCassetteTape(
+                        title = artistName,
+                        author = "Artist Essentials",
+                        trackCount = tracks.size,
+                        isPlaying = isPlaying,
+                        uiColors = uiColors,
+                        showControls = false,
+                        onNextClick = onNextClick,
+                        onPreviousClick = onPreviousClick,
+                        onPlayClick = {
+                            if (tracks.isNotEmpty()) {
+                                val isCurrentLoaded = currentSong != null && tracks.any { it.id == currentSong.id }
+                                if (isCurrentLoaded) {
+                                    onPlayPauseClick()
+                                } else {
+                                    onPlaySongWithoutNavigation(tracks.first())
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                if (isLoading && tracks.isEmpty()) {
+                    item {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 40.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = "Loading tracks...",
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(bottom = 16.dp)
+                                )
+                                SquigglyProgressBar(
+                                    progress = null,
+                                    color = uiColors.progressAccent,
+                                    trackColor = uiColors.cardBorder,
+                                    animated = true,
+                                    animationSpeed = 700,
+                                    modifier = Modifier
+                                        .fillMaxWidth(0.6f)
+                                        .height(16.dp)
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    if (isLoading) {
+                        item {
+                            SquigglyProgressBar(
+                                progress = null,
+                                color = uiColors.progressAccent,
+                                trackColor = uiColors.cardBorder,
+                                wavelength = 56.dp,
+                                amplitude = 5.dp,
+                                strokeWidth = 3.dp,
+                                animated = true,
+                                animationSpeed = 700,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(14.dp)
+                                    .padding(vertical = 4.dp)
+                            )
+                        }
+                    }
+                    items(tracks) { song ->
+                        TrackStandingCard(
+                            song = song,
+                            onClick = { onSongSelect(song) },
+                            uiColors = uiColors,
+                            hazeState = if (!artistThumbnailUrl.isNullOrBlank()) hazeState else null
+                        )
+                    }
+                    item {
+                        LoadMoreSquiggle(uiColors = uiColors)
+                    }
+                    item {
+                        Spacer(modifier = Modifier.height(80.dp))
+                    }
+                }
+            }
+        }
+
+        // Pinned Action Bar — fully transparent, no ghosting
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
+                .statusBarsPadding()
+                .height(56.dp)
+                .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(uiColors.cardBackground, shape = CircleShape)
-                    .border(1.dp, uiColors.cardBorder, CircleShape)
+                    .background(Color.Black.copy(alpha = 0.35f), shape = CircleShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape)
                     .clickable { onBackClick() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.ArrowBackIosNew,
                     contentDescription = "Back",
-                    tint = uiColors.textPrimary,
+                    tint = Color.White,
                     modifier = Modifier.size(16.dp)
                 )
             }
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "Artist Profile",
-                color = uiColors.textPrimary,
+                text = artistName,
+                color = Color.White,
                 fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .basicMarquee()
+                    .graphicsLayer { alpha = titleAlpha.value }
             )
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(146.dp)
-                .background(uiColors.cardBackground, shape = RoundedCornerShape(24.dp))
-                .border(1.dp, uiColors.cardBorder, RoundedCornerShape(24.dp))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 18.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val representativeThumbnail = artistThumbnailUrl ?: tracks.firstOrNull()?.thumbnailUrl
-                Box(
-                    modifier = Modifier
-                        .size(110.dp)
-                        .clip(CircleShape)
-                        .background(uiColors.cardBorder)
-                        .border(2.dp, uiColors.progressAccent, CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (!representativeThumbnail.isNullOrBlank()) {
-                        AsyncImage(
-                            model = representativeThumbnail,
-                            contentDescription = "Artist Art",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.MusicNote,
-                            contentDescription = "Artist Art",
-                            tint = uiColors.textSecondary,
-                            modifier = Modifier.size(48.dp)
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(18.dp))
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = artistName,
-                        color = uiColors.textPrimary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Artist",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-
-            if (tracks.isNotEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(bottom = 12.dp, end = 12.dp)
-                        .size(44.dp)
-                        .background(uiColors.progressAccent, shape = CircleShape)
-                        .clickable { onSongSelect(tracks.first()) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Play All",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        if (isLoading && tracks.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = "Loading tracks...",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(bottom = 16.dp)
-                    )
-                    SquigglyProgressBar(
-                        progress = null,
-                        color = uiColors.progressAccent,
-                        trackColor = uiColors.cardBorder,
-                        animated = true,
-                        animationSpeed = 700,
-                        modifier = Modifier
-                            .fillMaxWidth(0.6f)
-                            .height(16.dp)
-                    )
-                }
-            }
-        } else {
-            PullToRefreshContainer(
-                isRefreshing = isLoading,
-                onRefresh = onRefresh,
-                accentColor = uiColors.progressAccent,
-                backgroundColor = uiColors.cardBackground,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    if (isLoading) {
-                        SquigglyProgressBar(
-                            progress = null,
-                            color = uiColors.progressAccent,
-                            trackColor = uiColors.cardBorder,
-                            wavelength = 56.dp,
-                            amplitude = 5.dp,
-                            strokeWidth = 3.dp,
-                            animated = true,
-                            animationSpeed = 700,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(14.dp)
-                                .padding(vertical = 4.dp, horizontal = 16.dp)
-                        )
-                    }
-                    LazyColumn(
-                        state = artistListState,
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .align(Alignment.CenterHorizontally)
-                            .weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = 100.dp)
-                    ) {
-                        items(tracks) { song ->
-                            TrackStandingCard(
-                                song = song,
-                                onClick = { onSongSelect(song) },
-                                uiColors = uiColors
-                            )
-                        }
-                        // Load-more footer squiggle
-                        item {
-                            LoadMoreSquiggle(uiColors = uiColors)
-                        }
-                        item {
-                            Spacer(modifier = Modifier.height(80.dp))
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -1909,19 +2143,54 @@ fun ViewAllGenresView(
     }
 }
 
+@OptIn(ExperimentalHazeMaterialsApi::class, ExperimentalHazeApi::class)
 @Composable
 fun GenreDetailView(
     genreName: String,
     tracks: List<Song>,
     isLoading: Boolean,
+    isPlaying: Boolean,
+    currentSong: Song?,
     onBackClick: () -> Unit,
     onSongSelect: (Song) -> Unit,
+    onPlaySongWithoutNavigation: (Song) -> Unit = {},
+    onPlayPauseClick: () -> Unit,
+    onNextClick: () -> Unit = {},
+    onPreviousClick: () -> Unit = {},
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     uiColors: UIColors,
+    artistThumbnails: Map<String, String> = emptyMap(),
+    onLoadArtistThumbnail: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val genreListState = rememberLazyListState()
+    val hazeState = rememberHazeState()
+    val density = LocalDensity.current
+    val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+
+    LaunchedEffect(tracks) {
+        val seen = mutableSetOf<String>()
+        val uniqueArtists = mutableListOf<String>()
+        for (song in tracks) {
+            val artist = song.artist.trim()
+            if (artist.isNotEmpty() && seen.add(artist)) {
+                uniqueArtists.add(artist)
+            }
+            if (uniqueArtists.size >= 20) break
+        }
+        uniqueArtists.forEachIndexed { index, artistName ->
+            if (index > 0) {
+                delay(3000)
+            }
+            onLoadArtistThumbnail(artistName)
+        }
+    }
+
+    val slideshowUrls = remember(tracks, artistThumbnails) {
+        getPlaylistSlideshowUrls(tracks, artistThumbnails)
+    }
+    val hasBackground = slideshowUrls.isNotEmpty()
 
     val shouldLoadMoreGenre by remember {
         derivedStateOf {
@@ -1930,214 +2199,157 @@ fun GenreDetailView(
             lastVisibleItem.index >= genreListState.layoutInfo.totalItemsCount - 4
         }
     }
-
     LaunchedEffect(shouldLoadMoreGenre) {
-        if (shouldLoadMoreGenre) {
-            onLoadMore()
+        if (shouldLoadMoreGenre) onLoadMore()
+    }
+
+    val titleAlpha = remember {
+        derivedStateOf {
+            if (genreListState.firstVisibleItemIndex > 0) 1f
+            else {
+                val offset = genreListState.firstVisibleItemScrollOffset.toFloat()
+                val fadeRangePx = with(density) { 120.dp.toPx() }
+                (offset / fadeRangePx).coerceIn(0f, 1f)
+            }
         }
     }
 
-    Column(
+    Box(
         modifier = modifier
+            .fillMaxSize()
+            .clipToBounds()
     ) {
+        ArtistPhotoSlideshowBackground(
+            imageUrls = slideshowUrls,
+            hazeState = hazeState,
+            uiColors = uiColors
+        )
+
+        PullToRefreshContainer(
+            isRefreshing = isLoading,
+            onRefresh = onRefresh,
+            accentColor = uiColors.progressAccent,
+            backgroundColor = Color.Transparent,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            LazyColumn(
+                state = genreListState,
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .align(Alignment.TopCenter),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(top = statusBarHeight + 64.dp, bottom = 100.dp)
+            ) {
+                item {
+                    RetroCassetteTape(
+                        title = genreName,
+                        author = "Genre Mix",
+                        trackCount = tracks.size,
+                        isPlaying = isPlaying,
+                        uiColors = uiColors,
+                        showControls = false,
+                        onNextClick = onNextClick,
+                        onPreviousClick = onPreviousClick,
+                        onPlayClick = {
+                            if (tracks.isNotEmpty()) {
+                                val isCurrentLoaded = currentSong != null && tracks.any { it.id == currentSong.id }
+                                if (isCurrentLoaded) onPlayPauseClick()
+                                else onPlaySongWithoutNavigation(tracks.first())
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                if (isLoading && tracks.isEmpty()) {
+                    item {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 40.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "Loading tracks...",
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(bottom = 16.dp)
+                                )
+                                SquigglyProgressBar(
+                                    progress = null,
+                                    color = uiColors.progressAccent,
+                                    trackColor = uiColors.cardBorder,
+                                    animated = true,
+                                    animationSpeed = 700,
+                                    modifier = Modifier.fillMaxWidth(0.6f).height(16.dp)
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    if (isLoading) {
+                        item {
+                            SquigglyProgressBar(
+                                progress = null,
+                                color = uiColors.progressAccent,
+                                trackColor = uiColors.cardBorder,
+                                wavelength = 56.dp, amplitude = 5.dp, strokeWidth = 3.dp,
+                                animated = true, animationSpeed = 700,
+                                modifier = Modifier.fillMaxWidth().height(14.dp).padding(vertical = 4.dp)
+                            )
+                        }
+                    }
+                    items(tracks) { song ->
+                        TrackStandingCard(
+                            song = song,
+                            onClick = { onSongSelect(song) },
+                            uiColors = uiColors,
+                            hazeState = if (hasBackground) hazeState else null
+                        )
+                    }
+                    item { LoadMoreSquiggle(uiColors = uiColors) }
+                    item { Spacer(modifier = Modifier.height(80.dp)) }
+                }
+            }
+        }
+
+        // Pinned action bar — fully transparent
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
+                .statusBarsPadding()
+                .height(56.dp)
+                .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(uiColors.cardBackground, shape = CircleShape)
-                    .border(1.dp, uiColors.cardBorder, CircleShape)
+                    .background(Color.Black.copy(alpha = 0.35f), shape = CircleShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape)
                     .clickable { onBackClick() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.ArrowBackIosNew,
                     contentDescription = "Back",
-                    tint = uiColors.textPrimary,
+                    tint = Color.White,
                     modifier = Modifier.size(16.dp)
                 )
             }
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "Genre Playlist",
-                color = uiColors.textPrimary,
+                text = genreName,
+                color = Color.White,
                 fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .basicMarquee()
+                    .graphicsLayer { alpha = titleAlpha.value }
             )
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(146.dp)
-                .background(uiColors.cardBackground, shape = RoundedCornerShape(24.dp))
-                .border(1.dp, uiColors.cardBorder, RoundedCornerShape(24.dp))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 18.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val firstThumbnail = tracks.firstOrNull()?.thumbnailUrl
-                Box(
-                    modifier = Modifier
-                        .size(110.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(getGenreGradient(genreName)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (!firstThumbnail.isNullOrBlank()) {
-                        AsyncImage(
-                            model = firstThumbnail,
-                            contentDescription = "Genre Art",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.MusicNote,
-                            contentDescription = "Genre Art",
-                            tint = Color.White,
-                            modifier = Modifier.size(48.dp)
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(18.dp))
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = genreName,
-                        color = uiColors.textPrimary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Curated Genre Playlist",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    BadgeCapsule(text = "Sorted by Views", uiColors = uiColors)
-                }
-            }
-
-            if (tracks.isNotEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(bottom = 12.dp, end = 12.dp)
-                        .size(44.dp)
-                        .background(uiColors.progressAccent, shape = CircleShape)
-                        .clickable { onSongSelect(tracks.first()) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Play All",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        if (isLoading && tracks.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = "Loading tracks...",
-                        color = uiColors.textSecondary,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(bottom = 16.dp)
-                    )
-                    SquigglyProgressBar(
-                        progress = null,
-                        color = uiColors.progressAccent,
-                        trackColor = uiColors.cardBorder,
-                        animated = true,
-                        animationSpeed = 700,
-                        modifier = Modifier
-                            .fillMaxWidth(0.6f)
-                            .height(16.dp)
-                    )
-                }
-            }
-        } else {
-            PullToRefreshContainer(
-                isRefreshing = isLoading,
-                onRefresh = onRefresh,
-                accentColor = uiColors.progressAccent,
-                backgroundColor = uiColors.cardBackground,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    if (isLoading) {
-                        SquigglyProgressBar(
-                            progress = null,
-                            color = uiColors.progressAccent,
-                            trackColor = uiColors.cardBorder,
-                            wavelength = 56.dp,
-                            amplitude = 5.dp,
-                            strokeWidth = 3.dp,
-                            animated = true,
-                            animationSpeed = 700,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(14.dp)
-                                .padding(vertical = 4.dp, horizontal = 16.dp)
-                        )
-                    }
-                    LazyColumn(
-                        state = genreListState,
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .align(Alignment.CenterHorizontally)
-                            .weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = 100.dp)
-                    ) {
-                        items(tracks) { song ->
-                            TrackStandingCard(
-                                song = song,
-                                onClick = { onSongSelect(song) },
-                                uiColors = uiColors
-                            )
-                        }
-                        item {
-                            LoadMoreSquiggle(uiColors = uiColors)
-                        }
-                        item {
-                            Spacer(modifier = Modifier.height(80.dp))
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -2148,8 +2360,15 @@ fun EmptyStateArtistCard(
     onClick: () -> Unit,
     thumbnailUrl: String?,
     uiColors: UIColors,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onLoadThumbnail: (String) -> Unit = {}
 ) {
+    LaunchedEffect(artistName, thumbnailUrl) {
+        if (thumbnailUrl.isNullOrBlank()) {
+            onLoadThumbnail(artistName)
+        }
+    }
+
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -2204,7 +2423,8 @@ fun ViewAllArtistsView(
     onBackClick: () -> Unit,
     onArtistClick: (String) -> Unit,
     uiColors: UIColors,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onLoadArtistThumbnail: (String) -> Unit = {}
 ) {
     val focusManager = LocalFocusManager.current
     val initialCount = 20
@@ -2290,7 +2510,8 @@ fun ViewAllArtistsView(
                                     onArtistClick(artist)
                                 },
                                 thumbnailUrl = artistThumbnails[artist],
-                                uiColors = uiColors
+                                uiColors = uiColors,
+                                onLoadThumbnail = onLoadArtistThumbnail
                             )
                         }
                     }

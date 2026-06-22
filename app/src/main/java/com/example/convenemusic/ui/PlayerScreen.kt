@@ -1,6 +1,7 @@
 package com.example.convenemusic.ui
 
 import androidx.compose.animation.core.*
+import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,6 +16,14 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Equalizer
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.ui.window.Dialog
+import androidx.compose.runtime.saveable.rememberSaveable
+import android.widget.Toast
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,6 +39,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.Dp
 import coil3.compose.AsyncImage
 import com.example.convenemusic.network.Song
+import com.example.convenemusic.network.LyricLine
+import com.example.convenemusic.network.LyricsData
 import com.example.convenemusic.ui.components.SquigglyProgressBar
 import com.example.convenemusic.ui.theme.UIColors
 import com.example.convenemusic.ui.theme.LocalUIColors
@@ -43,6 +54,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.rotate
 import android.graphics.Bitmap
@@ -58,6 +70,7 @@ import androidx.compose.ui.draw.dropShadow
 import androidx.compose.ui.graphics.shadow.Shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -95,7 +108,14 @@ fun PlayerScreen(
     isSongDownloading: (String) -> Boolean = { false },
     onDownloadClick: (Song) -> Unit = {},
     isQueueLoadingMore: Boolean = false,
-    isQueueEndless: Boolean = true
+    isQueueEndless: Boolean = true,
+    customPlaylists: List<CustomPlaylist> = emptyList(),
+    onAddToPlaylist: (String, Song) -> Unit = { _, _ -> },
+    onCreatePlaylist: (String) -> Unit = {},
+    lyrics: LyricsData? = null,
+    isLyricsLoading: Boolean = false,
+    lyricsError: String? = null,
+    onRetryLyrics: () -> Unit = {}
 ) {
     val uiColors = LocalUIColors.current
     val context = LocalContext.current
@@ -107,14 +127,56 @@ fun PlayerScreen(
 
     var verticalDragAmount by remember { mutableStateOf(0f) }
     var queueSheetExpanded by remember { mutableStateOf(false) }
+    var activeTab by remember { mutableStateOf(0) } // 0 = Queue, 1 = Lyrics
+
+    // More Options & Equaliser state
+    var showMoreMenu by remember { mutableStateOf(false) }
+    var showEqualizerMenu by remember { mutableStateOf(false) }
+    val prefs = remember(context) { context.getSharedPreferences("convenemusic_prefs", android.content.Context.MODE_PRIVATE) }
+    var eqMode by remember {
+        mutableStateOf(prefs.getString("eq_mode", "Default") ?: "Default")
+    }
+    var eqValues by remember {
+        mutableStateOf(
+            listOf(
+                prefs.getFloat("eq_band_0", 0f),
+                prefs.getFloat("eq_band_1", 0f),
+                prefs.getFloat("eq_band_2", 0f),
+                prefs.getFloat("eq_band_3", 0f),
+                prefs.getFloat("eq_band_4", 0f)
+            )
+        )
+    }
+    var eqBassStrength by remember {
+        mutableStateOf(prefs.getFloat("eq_bass_strength", 0f))
+    }
+    var eqSurroundStrength by remember {
+        mutableStateOf(prefs.getFloat("eq_surround_strength", 0f))
+    }
+    var eqDefaultBassEnabled by remember {
+        mutableStateOf(prefs.getBoolean("eq_default_bass_enabled", true))
+    }
+    var eqDefaultAudioBoostEnabled by remember {
+        mutableStateOf(prefs.getBoolean("eq_default_audio_boost_enabled", true))
+    }
+    var eqDefaultSurroundEnabled by remember {
+        mutableStateOf(prefs.getBoolean("eq_default_surround_enabled", false))
+    }
+    var eqAudioBoostStrength by remember {
+        mutableStateOf(prefs.getFloat("eq_audio_boost_strength", 300f))
+    }
+    var showAddToPlaylistDialog by remember { mutableStateOf(false) }
+    var showCreatePlaylistDialog by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
+    val lyricsListState = rememberLazyListState()
 
-    val nestedScrollConnection = remember {
+    val nestedScrollConnection = remember(activeTab, listState, lyricsListState) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val currentListState = if (activeTab == 0) listState else lyricsListState
                 // When reverse scrolling (available.y > 0) at the top of the list
-                if (available.y > 0f && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
+                if (available.y > 0f && currentListState.firstVisibleItemIndex == 0 && currentListState.firstVisibleItemScrollOffset == 0) {
                     if (queueSheetExpanded) {
                         queueSheetExpanded = false
                         // Return the available Offset to consume it
@@ -149,15 +211,26 @@ fun PlayerScreen(
             .background(uiColors.background)
     ) {
         val screenHeight = maxHeight
-        val collapsedHeight = 72.dp
+        val screenWidth = maxWidth
+        val navigationBarsPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+        val collapsedHeight = 72.dp + navigationBarsPadding
         val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
         val targetExpandedOffset = statusBarHeight + 8.dp
         val expandedHeight = screenHeight - targetExpandedOffset
 
+        // Dynamic Sizing calculations based on device metrics (slightly reduced)
+        val maxImageWidth = screenWidth - 48.dp
+        val imageSize = (screenHeight * 0.30f).coerceIn(180.dp, 280.dp).coerceAtMost(maxImageWidth)
+        val controlButtonSize = (screenHeight * 0.075f).coerceIn(48.dp, 64.dp)
+        val playButtonSize = (screenHeight * 0.10f).coerceIn(64.dp, 84.dp)
+        val controlIconSize = controlButtonSize * 0.5f
+        val playIconSize = playButtonSize * 0.5f
+        val controlCornerRadius = controlButtonSize * 0.3f
+
         val sheetOffsetY by animateDpAsState(
             targetValue = if (queueSheetExpanded) targetExpandedOffset else (screenHeight - collapsedHeight),
             animationSpec = tween(
-                durationMillis = 600,
+                durationMillis = 1000,
                 easing = FastOutSlowInEasing
             ),
             label = "sheetOffsetY"
@@ -168,7 +241,7 @@ fun PlayerScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
-                .padding(start = 20.dp, end = 20.dp, bottom = 80.dp)
+                .padding(start = 20.dp, end = 20.dp, bottom = 110.dp)
                 .pointerInput(Unit) {
                     detectVerticalDragGestures(
                         onDragStart = {
@@ -222,29 +295,193 @@ fun PlayerScreen(
                 if (song != null) {
                     val isDownloaded = isSongDownloaded(song.id)
                     val isDownloading = isSongDownloading(song.id)
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(uiColors.cardBackground, shape = CircleShape)
-                            .border(1.dp, uiColors.cardBorder, CircleShape)
-                            .clickable(enabled = !isDownloaded && !isDownloading) {
-                                onDownloadClick(song)
-                            },
-                        contentAlignment = Alignment.Center
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (isDownloading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp),
-                                color = accentColor,
-                                strokeWidth = 2.dp
-                            )
-                        } else {
+                        // Add to Playlist Button
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(uiColors.cardBackground, shape = CircleShape)
+                                .border(1.dp, uiColors.cardBorder, CircleShape)
+                                .clickable { showAddToPlaylistDialog = true },
+                            contentAlignment = Alignment.Center
+                        ) {
                             Icon(
-                                imageVector = if (isDownloaded) Icons.Default.Check else Icons.Default.Download,
-                                contentDescription = "Download",
-                                tint = if (isDownloaded) accentColor else uiColors.textPrimary,
+                                imageVector = Icons.Default.Add,
+                                contentDescription = "Add to Playlist",
+                                tint = uiColors.textPrimary,
                                 modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        // More Options Button (replaces the Download button in the top bar)
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(uiColors.cardBackground, shape = CircleShape)
+                                .border(1.dp, uiColors.cardBorder, CircleShape)
+                                .clickable { showMoreMenu = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "More Options",
+                                tint = uiColors.textPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        
+                        // Add to Playlist Dialog
+                        if (showAddToPlaylistDialog) {
+                            AlertDialog(
+                                onDismissRequest = { showAddToPlaylistDialog = false },
+                                title = {
+                                    Text(
+                                        text = "Add to Playlist",
+                                        color = uiColors.textPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 18.sp
+                                    )
+                                },
+                                text = {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                showAddToPlaylistDialog = false
+                                                showCreatePlaylistDialog = true
+                                            },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = accentColor,
+                                                contentColor = Color.White
+                                            ),
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Add,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Create New Playlist", fontWeight = FontWeight.Bold)
+                                        }
+
+                                        Spacer(modifier = Modifier.height(4.dp))
+
+                                        if (customPlaylists.isEmpty()) {
+                                            Text(
+                                                text = "No custom playlists yet.",
+                                                color = uiColors.textSecondary,
+                                                fontSize = 14.sp
+                                            )
+                                        } else {
+                                            androidx.compose.foundation.lazy.LazyColumn(
+                                                modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp),
+                                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                items(customPlaylists.size) { index ->
+                                                    val pl = customPlaylists[index]
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .clickable {
+                                                                onAddToPlaylist(pl.name, song)
+                                                                Toast.makeText(context, "Added to ${pl.name}", Toast.LENGTH_SHORT).show()
+                                                                showAddToPlaylistDialog = false
+                                                            }
+                                                            .padding(vertical = 8.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.List,
+                                                            contentDescription = null,
+                                                            tint = accentColor,
+                                                            modifier = Modifier.size(20.dp)
+                                                        )
+                                                        Spacer(modifier = Modifier.width(12.dp))
+                                                        Text(
+                                                            text = pl.name,
+                                                            color = uiColors.textPrimary,
+                                                            fontSize = 15.sp,
+                                                            fontWeight = FontWeight.Medium
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = { showAddToPlaylistDialog = false }) {
+                                        Text("Cancel", color = accentColor)
+                                    }
+                                },
+                                containerColor = uiColors.background,
+                                shape = RoundedCornerShape(24.dp),
+                                modifier = Modifier.border(1.dp, uiColors.cardBorder, RoundedCornerShape(24.dp))
+                            )
+                        }
+
+                        // Create Playlist Dialog
+                        if (showCreatePlaylistDialog) {
+                            var playlistName by remember { mutableStateOf("") }
+                            AlertDialog(
+                                onDismissRequest = { showCreatePlaylistDialog = false },
+                                title = {
+                                    Text(
+                                        text = "Create Playlist",
+                                        color = uiColors.textPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 18.sp
+                                    )
+                                },
+                                text = {
+                                    OutlinedTextField(
+                                        value = playlistName,
+                                        onValueChange = { playlistName = it },
+                                        label = { Text("Playlist Name", color = uiColors.textSecondary) },
+                                        singleLine = true,
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedBorderColor = accentColor,
+                                            unfocusedBorderColor = uiColors.cardBorder,
+                                            focusedTextColor = uiColors.textPrimary,
+                                            unfocusedTextColor = uiColors.textPrimary,
+                                            cursorColor = accentColor
+                                        ),
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                },
+                                confirmButton = {
+                                    TextButton(
+                                        onClick = {
+                                            if (playlistName.isNotBlank()) {
+                                                onCreatePlaylist(playlistName.trim())
+                                                onAddToPlaylist(playlistName.trim(), song)
+                                                Toast.makeText(context, "Created & Added to ${playlistName.trim()}", Toast.LENGTH_SHORT).show()
+                                                showCreatePlaylistDialog = false
+                                            }
+                                        }
+                                    ) {
+                                        Text("Done", color = accentColor, fontWeight = FontWeight.Bold)
+                                    }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showCreatePlaylistDialog = false }) {
+                                        Text("Cancel", color = uiColors.textSecondary)
+                                    }
+                                },
+                                containerColor = uiColors.background,
+                                shape = RoundedCornerShape(24.dp),
+                                modifier = Modifier.border(1.dp, uiColors.cardBorder, RoundedCornerShape(24.dp))
                             )
                         }
                     }
@@ -254,10 +491,12 @@ fun PlayerScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             if (song != null) {
+                Spacer(modifier = Modifier.weight(1f))
+
                 // Album Art Container (High Rounded Corner Card)
                 Box(
                     modifier = Modifier
-                        .size(300.dp)
+                        .size(imageSize)
                         .dropShadow(
                             shape = RoundedCornerShape(32.dp),
                             shadow = Shadow(
@@ -298,7 +537,7 @@ fun PlayerScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.weight(1f))
 
                 // Song Title and Artist Labels
                 Column(
@@ -323,7 +562,7 @@ fun PlayerScreen(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.weight(0.8f))
 
                 // Squiggly seekbar — tap OR drag to seek
                 val progress = if (durationMs > 0) positionMs.toFloat() / durationMs else 0f
@@ -381,7 +620,7 @@ fun PlayerScreen(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.weight(1.2f))
 
                 // Control Buttons
                 Row(
@@ -392,10 +631,10 @@ fun PlayerScreen(
                     val prevEnabled = true
                     Box(
                         modifier = Modifier
-                            .size(60.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(uiColors.cardBackground, shape = RoundedCornerShape(18.dp))
-                            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(18.dp))
+                            .size(controlButtonSize)
+                            .clip(RoundedCornerShape(controlCornerRadius))
+                            .background(uiColors.cardBackground, shape = RoundedCornerShape(controlCornerRadius))
+                            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(controlCornerRadius))
                             .clickable(enabled = prevEnabled) { onPreviousClick() },
                         contentAlignment = Alignment.Center
                     ) {
@@ -403,12 +642,12 @@ fun PlayerScreen(
                             imageVector = Icons.Default.SkipPrevious,
                             contentDescription = "Previous",
                             tint = if (prevEnabled) uiColors.textPrimary else uiColors.textSecondary.copy(alpha = 0.4f),
-                            modifier = Modifier.size(30.dp)
+                            modifier = Modifier.size(controlIconSize)
                         )
                     }
                     Spacer(modifier = Modifier.width(24.dp))
                     val playPauseShapePercent by animateDpAsState(
-                        targetValue = if (isPlaying) 38.dp else 22.dp,
+                        targetValue = if (isPlaying) (playButtonSize * 0.475f) else (playButtonSize * 0.275f),
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioMediumBouncy,
                             stiffness = Spring.StiffnessLow
@@ -417,7 +656,7 @@ fun PlayerScreen(
                     )
                     Box(
                         modifier = Modifier
-                            .size(80.dp)
+                            .size(playButtonSize)
                             .clip(RoundedCornerShape(playPauseShapePercent))
                             .background(accentColor, shape = RoundedCornerShape(playPauseShapePercent))
                             .clickable { onPlayPauseClick() },
@@ -427,16 +666,16 @@ fun PlayerScreen(
                             imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                             contentDescription = "Play/Pause",
                             tint = Color.White,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(playIconSize)
                         )
                     }
                     Spacer(modifier = Modifier.width(24.dp))
                     Box(
                         modifier = Modifier
-                            .size(60.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(uiColors.cardBackground, shape = RoundedCornerShape(18.dp))
-                            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(18.dp))
+                            .size(controlButtonSize)
+                            .clip(RoundedCornerShape(controlCornerRadius))
+                            .background(uiColors.cardBackground, shape = RoundedCornerShape(controlCornerRadius))
+                            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(controlCornerRadius))
                             .clickable { onNextClick() },
                         contentAlignment = Alignment.Center
                     ) {
@@ -444,10 +683,12 @@ fun PlayerScreen(
                             imageVector = Icons.Default.SkipNext,
                             contentDescription = "Next",
                             tint = uiColors.textPrimary,
-                            modifier = Modifier.size(30.dp)
+                            modifier = Modifier.size(controlIconSize)
                         )
                     }
                 }
+
+                Spacer(modifier = Modifier.weight(0.8f))
 
             } else {
                 Box(
@@ -487,26 +728,6 @@ fun PlayerScreen(
                         uiColors.cardBorder.copy(alpha = 0.8f),
                         RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp)
                     )
-                    .clickable(enabled = !queueSheetExpanded) {
-                        queueSheetExpanded = true
-                    }
-                    .let { mod ->
-                        if (!queueSheetExpanded) {
-                            mod.pointerInput(Unit) {
-                                detectVerticalDragGestures(
-                                    onDragEnd = {},
-                                    onVerticalDrag = { change, dragAmount ->
-                                        change.consume()
-                                        if (dragAmount < -10f) {
-                                            queueSheetExpanded = true
-                                        }
-                                    }
-                                )
-                            }
-                        } else {
-                            mod
-                        }
-                    }
             ) {
                 Column(
                     modifier = Modifier.fillMaxSize(),
@@ -534,223 +755,301 @@ fun PlayerScreen(
                             },
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        
-                        // Drag Handle Line
-                        Box(
+                        // Header Row (Queue and Lyrics buttons)
+                        Row(
                             modifier = Modifier
-                                .width(40.dp)
-                                .height(4.dp)
-                                .clip(CircleShape)
-                                .background(uiColors.textSecondary.copy(alpha = 0.4f), shape = CircleShape)
-                                .clickable {
-                                    queueSheetExpanded = !queueSheetExpanded
-                                }
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        if (!queueSheetExpanded) {
-                            // Peek collapsed state
-                            Text(
-                                text = "Your queue",
-                                color = uiColors.textPrimary,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                        } else {
-                            // Expanded State Content
-                            
-                            // Mini player bar at the top of the sheet
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 20.dp, vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                AsyncImage(
-                                    model = song.thumbnailUrl,
-                                    contentDescription = "Mini Art",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(RoundedCornerShape(8.dp))
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column(
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text(
-                                        text = song.title,
-                                        color = uiColors.textPrimary,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 14.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = cleanArtist,
-                                        color = uiColors.textSecondary,
-                                        fontSize = 12.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                val miniPlayPauseShapePercent by animateDpAsState(
-                                    targetValue = if (isPlaying) 20.dp else 12.dp,
-                                    animationSpec = spring(
-                                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                                        stiffness = Spring.StiffnessLow
-                                    ),
-                                    label = "miniPlayPauseShape"
-                                )
-                                Box(
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(RoundedCornerShape(miniPlayPauseShapePercent))
-                                        .background(accentColor, shape = RoundedCornerShape(miniPlayPauseShapePercent))
-                                        .clickable { onPlayPauseClick() },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                        contentDescription = "Play/Pause",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(22.dp)
-                                    )
-                                }
-                            }
-
-                            // Divider (1.dp Box)
+                                .fillMaxWidth()
+                                .height(72.dp)
+                                .padding(horizontal = 20.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Queue Button
                             Box(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(1.dp)
-                                    .background(uiColors.cardBorder)
-                            )
-
-                            // "Playing from" header (centered "Queue")
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(if (queueSheetExpanded && activeTab == 0) accentColor else uiColors.cardBackground)
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (queueSheetExpanded && activeTab == 0) Color.Transparent else uiColors.cardBorder,
+                                        shape = RoundedCornerShape(16.dp)
+                                    )
+                                    .clickable { 
+                                        if (!queueSheetExpanded) {
+                                            activeTab = 0
+                                            queueSheetExpanded = true
+                                        } else {
+                                            if (activeTab == 0) {
+                                                queueSheetExpanded = false
+                                            } else {
+                                                activeTab = 0
+                                            }
+                                        }
+                                    },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     text = "Queue",
-                                    color = uiColors.textPrimary,
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.ExtraBold
+                                    color = if (queueSheetExpanded && activeTab == 0) Color.White else uiColors.textPrimary,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            // Lyrics Button
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(if (queueSheetExpanded && activeTab == 1) accentColor else uiColors.cardBackground)
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (queueSheetExpanded && activeTab == 1) Color.Transparent else uiColors.cardBorder,
+                                        shape = RoundedCornerShape(16.dp)
+                                    )
+                                    .clickable { 
+                                        if (!queueSheetExpanded) {
+                                            activeTab = 1
+                                            queueSheetExpanded = true
+                                        } else {
+                                            if (activeTab == 1) {
+                                                queueSheetExpanded = false
+                                            } else {
+                                                activeTab = 1
+                                            }
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "Lyrics",
+                                    color = if (queueSheetExpanded && activeTab == 1) Color.White else uiColors.textPrimary,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold
                                 )
                             }
                         }
                     }
-
                     if (queueSheetExpanded) {
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        // Queue Songs List
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .nestedScroll(nestedScrollConnection),
-                            contentPadding = PaddingValues(bottom = 24.dp)
-                        ) {
-                            itemsIndexed(queue) { index, queueSong ->
-                                val isCurrent = index == currentQueueIndex
-                                
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { onQueueSongClick(index) }
-                                        .background(
-                                            color = if (isCurrent) uiColors.cardBorder.copy(alpha = 0.2f) else Color.Transparent
+                        if (activeTab == 0) {
+                            // Queue Songs List
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                                    .nestedScroll(nestedScrollConnection),
+                                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp + navigationBarsPadding),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                // 1. Now Playing Section
+                                val currentSongItem = queue.getOrNull(currentQueueIndex) ?: song
+                                item {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        Text(
+                                            text = "Now Playing",
+                                            color = uiColors.textSecondary,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(vertical = 8.dp)
                                         )
-                                        .padding(horizontal = 20.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    // Thumbnail with playing soundwave indicator overlay
-                                    Box(
-                                        modifier = Modifier
-                                            .size(48.dp)
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(Color.LightGray)
-                                    ) {
-                                        AsyncImage(
-                                            model = queueSong.thumbnailUrl,
-                                            contentDescription = "Track Thumbnail",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
+                                        QueueSongCard(
+                                            song = currentSongItem,
+                                            isCurrent = true,
+                                            isPlaying = isPlaying,
+                                            onPlayPauseClick = onPlayPauseClick,
+                                            onClick = { /* Clicking current song does nothing */ },
+                                            uiColors = uiColors,
+                                            accentColor = accentColor
                                         )
-                                        if (isCurrent) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxSize()
-                                                    .background(Color.Black.copy(alpha = 0.5f)),
-                                                contentAlignment = Alignment.Center
+                                    }
+                                }
+
+                                // 2. Next In Queue Section
+                                val nextSongs = if (currentQueueIndex in queue.indices) {
+                                    queue.subList(currentQueueIndex + 1, queue.size)
+                                } else {
+                                    emptyList()
+                                }
+                                if (nextSongs.isNotEmpty()) {
+                                    item {
+                                        Text(
+                                            text = "Next In Queue",
+                                            color = uiColors.textSecondary,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
+                                        )
+                                    }
+                                    itemsIndexed(nextSongs) { index, nextSong ->
+                                        val actualQueueIndex = currentQueueIndex + 1 + index
+                                        QueueSongCard(
+                                            song = nextSong,
+                                            isCurrent = false,
+                                            isPlaying = false,
+                                            onClick = { onQueueSongClick(actualQueueIndex) },
+                                            uiColors = uiColors,
+                                            accentColor = accentColor
+                                        )
+                                    }
+                                }
+
+                                // Load-more squiggly footer
+                                if (isQueueEndless && isQueueLoadingMore) {
+                                    item {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 20.dp),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Column(
+                                                horizontalAlignment = Alignment.CenterHorizontally
                                             ) {
-                                                SoundwaveIndicator(color = accentColor)
+                                                Text(
+                                                    text = "Loading more...",
+                                                    color = uiColors.textSecondary,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    modifier = Modifier.padding(bottom = 10.dp)
+                                                )
+                                                SquigglyProgressBar(
+                                                    progress = null,
+                                                    color = accentColor,
+                                                    trackColor = uiColors.cardBorder,
+                                                    animated = true,
+                                                    animationSpeed = 700,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth(0.5f)
+                                                        .height(14.dp)
+                                                )
                                             }
                                         }
                                     }
-                                    
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    
-                                    Column(
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text(
-                                            text = queueSong.title,
-                                            color = if (isCurrent) accentColor else uiColors.textPrimary,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        Text(
-                                            text = queueSong.artist,
-                                            color = uiColors.textSecondary,
-                                            fontSize = 12.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                    
-
                                 }
                             }
-                            // Load-more squiggly footer
-                            if (isQueueEndless && isQueueLoadingMore) {
-                                item {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 20.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
+                        } else {
+                            // Lyrics Page
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                            ) {
+                                when {
+                                    isLyricsLoading -> {
+                                        Box(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            CircularProgressIndicator(color = accentColor)
+                                        }
+                                    }
+                                    lyricsError != null && lyrics == null -> {
                                         Column(
-                                            horizontalAlignment = Alignment.CenterHorizontally
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .padding(24.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.Center
                                         ) {
                                             Text(
-                                                text = "Loading more...",
+                                                text = lyricsError ?: "Failed to load lyrics",
                                                 color = uiColors.textSecondary,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Medium,
-                                                modifier = Modifier.padding(bottom = 10.dp)
+                                                fontSize = 15.sp,
+                                                fontWeight = FontWeight.Medium
                                             )
-                                            SquigglyProgressBar(
-                                                progress = null,
-                                                color = accentColor,
-                                                trackColor = uiColors.cardBorder,
-                                                animated = true,
-                                                animationSpeed = 700,
-                                                modifier = Modifier
-                                                    .fillMaxWidth(0.5f)
-                                                    .height(14.dp)
+                                            Spacer(modifier = Modifier.height(12.dp))
+                                            Button(
+                                                onClick = onRetryLyrics,
+                                                colors = ButtonDefaults.buttonColors(containerColor = accentColor)
+                                            ) {
+                                                Text("Retry", color = Color.White, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    }
+                                    lyrics == null || lyrics.lines.isEmpty() -> {
+                                        Box(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                text = "No lyrics found",
+                                                color = uiColors.textSecondary,
+                                                fontSize = 16.sp,
+                                                fontWeight = FontWeight.Medium
                                             )
+                                        }
+                                    }
+                                    else -> {
+                                        val lyricsData = lyrics
+                                        val lines = lyricsData.lines
+                                        val activeLineIndex = remember(positionMs, lyricsData) {
+                                            if (lines.isEmpty()) -1
+                                            else if (lyricsData.isSynced) {
+                                                lines.indexOfLast { it.timestampMs <= positionMs }
+                                            } else {
+                                                -1
+                                            }
+                                        }
+
+                                        LaunchedEffect(activeLineIndex) {
+                                            if (lyricsData.isSynced && lines.isNotEmpty() && activeLineIndex >= 0) {
+                                                val targetScrollIndex = (activeLineIndex - 2).coerceAtLeast(0)
+                                                lyricsListState.animateScrollToItem(targetScrollIndex)
+                                            }
+                                        }
+
+                                        LazyColumn(
+                                            state = lyricsListState,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .nestedScroll(nestedScrollConnection),
+                                            contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 48.dp + navigationBarsPadding),
+                                            verticalArrangement = Arrangement.spacedBy(18.dp)
+                                        ) {
+                                            itemsIndexed(lines) { index, line ->
+                                                val isActive = lyricsData.isSynced && index == activeLineIndex
+                                                val fontColor = if (lyricsData.isSynced) {
+                                                    if (isActive) Color.White else uiColors.textPrimary.copy(alpha = 0.45f)
+                                                } else {
+                                                    uiColors.textPrimary.copy(alpha = 0.75f)
+                                                }
+                                                val fontSize = if (lyricsData.isSynced) {
+                                                    if (isActive) 24.sp else 20.sp
+                                                } else {
+                                                    18.sp
+                                                }
+                                                val fontWeight = if (lyricsData.isSynced) {
+                                                    if (isActive) FontWeight.ExtraBold else FontWeight.Bold
+                                                } else {
+                                                    FontWeight.Medium
+                                                }
+
+                                                Text(
+                                                    text = line.text.ifBlank { " " },
+                                                    color = fontColor,
+                                                    fontSize = fontSize,
+                                                    fontWeight = fontWeight,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .let {
+                                                            if (lyricsData.isSynced && line.text.isNotBlank() && durationMs > 0) {
+                                                                it.clickable {
+                                                                    onSeek(line.timestampMs)
+                                                                }
+                                                            } else {
+                                                                it
+                                                            }
+                                                        }
+                                                        .padding(vertical = 4.dp),
+                                                    lineHeight = 32.sp
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -759,6 +1058,588 @@ fun PlayerScreen(
                     }
                 }
             }
+        }
+
+        // 3. More Options Menu Dialog
+        if (showMoreMenu && song != null) {
+            val isDownloaded = isSongDownloaded(song.id)
+            val isDownloading = isSongDownloading(song.id)
+            
+            Dialog(onDismissRequest = { showMoreMenu = false }) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = uiColors.background),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, uiColors.cardBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                    ) {
+                        // Close button at top right
+                        IconButton(
+                            onClick = { showMoreMenu = false },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Close",
+                                tint = uiColors.textSecondary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 28.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // "Save to Playlist" option
+                            PopupOptionCard(
+                                icon = Icons.Default.Add,
+                                title = "Save to Playlist",
+                                subtitle = "Add this song to your custom playlists",
+                                onClick = {
+                                    showMoreMenu = false
+                                    showAddToPlaylistDialog = true
+                                },
+                                uiColors = uiColors,
+                                accentColor = accentColor
+                            )
+
+                            // "Download/Cancel Download" option
+                            val (downloadText, downloadSub, downloadIcon) = when {
+                                isDownloading -> Triple("Cancel Download", "Stop downloading this song", Icons.Default.Close)
+                                isDownloaded -> Triple("Delete Download", "Remove from offline storage", Icons.Default.Delete)
+                                else -> Triple("Download Song", "Save offline for playback anywhere", Icons.Default.Download)
+                            }
+                            
+                            PopupOptionCard(
+                                icon = downloadIcon,
+                                title = downloadText,
+                                subtitle = downloadSub,
+                                onClick = {
+                                    showMoreMenu = false
+                                    onDownloadClick(song)
+                                },
+                                uiColors = uiColors,
+                                accentColor = accentColor
+                            )
+
+                            // "Equaliser" option
+                            PopupOptionCard(
+                                icon = Icons.Default.Equalizer,
+                                title = "Equaliser",
+                                subtitle = "Adjust frequencies and settings",
+                                onClick = {
+                                    showMoreMenu = false
+                                    showEqualizerMenu = true
+                                },
+                                uiColors = uiColors,
+                                accentColor = accentColor
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Equaliser Dialog
+        if (showEqualizerMenu && song != null) {
+            Dialog(onDismissRequest = { showEqualizerMenu = false }) {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = uiColors.background),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, uiColors.cardBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .height(530.dp) // Fixed height to prevent dialog window resize jitter
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp)
+                    ) {
+                        // Header
+                        Text(
+                            text = "Equaliser",
+                            color = uiColors.textPrimary,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.align(Alignment.TopStart)
+                        )
+
+                        // Close button at top right
+                        IconButton(
+                            onClick = { showEqualizerMenu = false },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Close",
+                                tint = uiColors.textSecondary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = 40.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            // Selector for Default and Custom
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                // Default Option Card
+                                val isDefault = eqMode == "Default"
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(if (isDefault) accentColor else uiColors.cardBackground)
+                                        .border(
+                                            1.dp,
+                                            if (isDefault) Color.Transparent else uiColors.cardBorder,
+                                            RoundedCornerShape(14.dp)
+                                        )
+                                        .clickable {
+                                            eqMode = "Default"
+                                            prefs.edit().putString("eq_mode", "Default").apply()
+                                            com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "Default",
+                                        color = if (isDefault) Color.White else uiColors.textPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                }
+
+                                // Custom Option Card
+                                val isCustom = eqMode == "Custom"
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(if (isCustom) accentColor else uiColors.cardBackground)
+                                        .border(
+                                            1.dp,
+                                            if (isCustom) Color.Transparent else uiColors.cardBorder,
+                                            RoundedCornerShape(14.dp)
+                                        )
+                                        .clickable {
+                                            eqMode = "Custom"
+                                            prefs.edit().putString("eq_mode", "Custom").apply()
+                                            com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "Custom",
+                                        color = if (isCustom) Color.White else uiColors.textPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                            }
+
+                            // Content area with Crossfade for smooth switching
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                            ) {
+                                Crossfade(
+                                    targetState = eqMode,
+                                    animationSpec = tween(300),
+                                    label = "EqualiserContentTransition"
+                                ) { currentMode ->
+                                    if (currentMode == "Default") {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .verticalScroll(rememberScrollState())
+                                                .padding(vertical = 4.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            // Glowing visualizer icon representation
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(64.dp)
+                                                    .clip(CircleShape)
+                                                    .background(accentColor.copy(alpha = 0.1f))
+                                                    .border(2.dp, accentColor.copy(alpha = 0.3f), CircleShape),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Equalizer,
+                                                    contentDescription = null,
+                                                    tint = accentColor,
+                                                    modifier = Modifier.size(32.dp)
+                                                )
+                                            }
+                                            
+                                            Text(
+                                                text = "Convene Signature Sound",
+                                                color = uiColors.textPrimary,
+                                                fontSize = 15.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            
+                                            // On/Off Toggles
+                                            Column(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                DefaultToggleRow(
+                                                    title = "Bass Boost",
+                                                    subtitle = "Signature low-end punch (100%)",
+                                                    checked = eqDefaultBassEnabled,
+                                                    onCheckedChange = { newValue ->
+                                                        eqDefaultBassEnabled = newValue
+                                                        prefs.edit().putBoolean("eq_default_bass_enabled", newValue).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    uiColors = uiColors,
+                                                    accentColor = accentColor
+                                                )
+
+                                                DefaultToggleRow(
+                                                    title = "Audio Boost",
+                                                    subtitle = "Enhanced clarity & loudness (+3 dB)",
+                                                    checked = eqDefaultAudioBoostEnabled,
+                                                    onCheckedChange = { newValue ->
+                                                        eqDefaultAudioBoostEnabled = newValue
+                                                        prefs.edit().putBoolean("eq_default_audio_boost_enabled", newValue).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    uiColors = uiColors,
+                                                    accentColor = accentColor
+                                                )
+
+                                                DefaultToggleRow(
+                                                    title = "Surround Sound",
+                                                    subtitle = "3D spatializer soundstage (100%)",
+                                                    checked = eqDefaultSurroundEnabled,
+                                                    onCheckedChange = { newValue ->
+                                                        eqDefaultSurroundEnabled = newValue
+                                                        prefs.edit().putBoolean("eq_default_surround_enabled", newValue).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    uiColors = uiColors,
+                                                    accentColor = accentColor
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .verticalScroll(rememberScrollState()),
+                                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            Text(
+                                                text = "Custom Settings",
+                                                color = uiColors.textSecondary,
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(bottom = 4.dp)
+                                            )
+                                            
+                                            val bands = listOf(
+                                                "60 Hz" to "Bass",
+                                                "230 Hz" to "Mid-Bass",
+                                                "910 Hz" to "Midrange",
+                                                "4 kHz" to "High-Mid",
+                                                "14 kHz" to "Treble"
+                                            )
+                                            
+                                            bands.forEachIndexed { index, band ->
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Column(modifier = Modifier.width(64.dp)) {
+                                                        Text(
+                                                            text = band.first,
+                                                            color = uiColors.textPrimary,
+                                                            fontSize = 12.sp,
+                                                            fontWeight = FontWeight.Bold
+                                                        )
+                                                        Text(
+                                                            text = band.second,
+                                                            color = uiColors.textSecondary,
+                                                            fontSize = 10.sp
+                                                        )
+                                                    }
+                                                    
+                                                    Slider(
+                                                        value = eqValues[index],
+                                                        onValueChange = { newValue ->
+                                                            val newList = eqValues.toMutableList()
+                                                            newList[index] = newValue
+                                                            eqValues = newList
+                                                        },
+                                                        onValueChangeFinished = {
+                                                            eqValues.forEachIndexed { idx, valDb ->
+                                                                prefs.edit().putFloat("eq_band_$idx", valDb).apply()
+                                                            }
+                                                            com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                        },
+                                                        valueRange = -15f..15f,
+                                                        colors = SliderDefaults.colors(
+                                                            thumbColor = accentColor,
+                                                            activeTrackColor = accentColor,
+                                                            inactiveTrackColor = uiColors.cardBorder,
+                                                            activeTickColor = Color.Transparent,
+                                                            inactiveTickColor = Color.Transparent
+                                                        ),
+                                                        modifier = Modifier.weight(1f)
+                                                    )
+                                                    
+                                                    Text(
+                                                        text = String.format("%+d dB", eqValues[index].toInt()),
+                                                        color = uiColors.textPrimary,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.width(42.dp),
+                                                        textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                                    )
+                                                }
+                                            }
+
+                                            HorizontalDivider(
+                                                modifier = Modifier.padding(vertical = 8.dp),
+                                                color = uiColors.cardBorder
+                                            )
+
+                                            // Bass Boost Slider
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.width(64.dp)) {
+                                                    Text(
+                                                        text = "Bass Boost",
+                                                        color = uiColors.textPrimary,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                    Text(
+                                                        text = "Low-end",
+                                                        color = uiColors.textSecondary,
+                                                        fontSize = 10.sp
+                                                    )
+                                                }
+                                                
+                                                Slider(
+                                                    value = eqBassStrength,
+                                                    onValueChange = { newValue ->
+                                                        eqBassStrength = newValue
+                                                    },
+                                                    onValueChangeFinished = {
+                                                        prefs.edit().putFloat("eq_bass_strength", eqBassStrength).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    valueRange = 0f..1000f,
+                                                    colors = SliderDefaults.colors(
+                                                        thumbColor = accentColor,
+                                                        activeTrackColor = accentColor,
+                                                        inactiveTrackColor = uiColors.cardBorder,
+                                                        activeTickColor = Color.Transparent,
+                                                        inactiveTickColor = Color.Transparent
+                                                    ),
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                
+                                                Text(
+                                                    text = String.format("%d%%", (eqBassStrength / 10f).toInt()),
+                                                    color = uiColors.textPrimary,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.width(42.dp),
+                                                    textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                                )
+                                            }
+
+                                            // Audio Boost Slider
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.width(64.dp)) {
+                                                    Text(
+                                                        text = "Audio Boost",
+                                                        color = uiColors.textPrimary,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                    Text(
+                                                        text = "Loudness",
+                                                        color = uiColors.textSecondary,
+                                                        fontSize = 10.sp
+                                                    )
+                                                }
+                                                
+                                                Slider(
+                                                    value = eqAudioBoostStrength,
+                                                    onValueChange = { newValue ->
+                                                        eqAudioBoostStrength = newValue
+                                                    },
+                                                    onValueChangeFinished = {
+                                                        prefs.edit().putFloat("eq_audio_boost_strength", eqAudioBoostStrength).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    valueRange = 0f..1000f,
+                                                    colors = SliderDefaults.colors(
+                                                        thumbColor = accentColor,
+                                                        activeTrackColor = accentColor,
+                                                        inactiveTrackColor = uiColors.cardBorder,
+                                                        activeTickColor = Color.Transparent,
+                                                        inactiveTickColor = Color.Transparent
+                                                    ),
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                
+                                                Text(
+                                                    text = String.format("%d%%", (eqAudioBoostStrength / 10f).toInt()),
+                                                    color = uiColors.textPrimary,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.width(42.dp),
+                                                    textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                                )
+                                            }
+
+                                            // Surround Sound Slider
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.width(64.dp)) {
+                                                    Text(
+                                                        text = "Surround",
+                                                        color = uiColors.textPrimary,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                    Text(
+                                                        text = "3D Spatial",
+                                                        color = uiColors.textSecondary,
+                                                        fontSize = 10.sp
+                                                    )
+                                                }
+                                                
+                                                Slider(
+                                                    value = eqSurroundStrength,
+                                                    onValueChange = { newValue ->
+                                                        eqSurroundStrength = newValue
+                                                    },
+                                                    onValueChangeFinished = {
+                                                        prefs.edit().putFloat("eq_surround_strength", eqSurroundStrength).apply()
+                                                        com.example.convenemusic.playback.PlaybackServiceConnector.onEqualizerChanged?.invoke()
+                                                    },
+                                                    valueRange = 0f..1000f,
+                                                    colors = SliderDefaults.colors(
+                                                        thumbColor = accentColor,
+                                                        activeTrackColor = accentColor,
+                                                        inactiveTrackColor = uiColors.cardBorder,
+                                                        activeTickColor = Color.Transparent,
+                                                        inactiveTickColor = Color.Transparent
+                                                    ),
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                
+                                                Text(
+                                                    text = String.format("%d%%", (eqSurroundStrength / 10f).toInt()),
+                                                    color = uiColors.textPrimary,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.width(42.dp),
+                                                    textAlign = androidx.compose.ui.text.style.TextAlign.End
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PopupOptionCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    uiColors: UIColors,
+    accentColor: Color
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(uiColors.cardBackground)
+            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(16.dp))
+            .clickable { onClick() }
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(accentColor.copy(alpha = 0.15f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = accentColor,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(
+            modifier = Modifier.weight(1f)
+        ) {
+            Text(
+                text = title,
+                color = uiColors.textPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = subtitle,
+                color = uiColors.textSecondary,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -802,6 +1683,104 @@ fun SoundwaveIndicator(color: Color) {
         Box(modifier = Modifier.width(3.dp).height(h1.dp).background(color, RoundedCornerShape(1.5.dp)))
         Box(modifier = Modifier.width(3.dp).height(h2.dp).background(color, RoundedCornerShape(1.5.dp)))
         Box(modifier = Modifier.width(3.dp).height(h3.dp).background(color, RoundedCornerShape(1.5.dp)))
+    }
+}
+
+@Composable
+fun QueueSongCard(
+    song: Song,
+    isCurrent: Boolean,
+    isPlaying: Boolean,
+    onClick: () -> Unit,
+    uiColors: UIColors,
+    accentColor: Color,
+    onPlayPauseClick: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(
+                if (isCurrent) uiColors.cardBorder.copy(alpha = 0.2f) else uiColors.cardBackground,
+                shape = RoundedCornerShape(20.dp)
+            )
+            .border(
+                width = 1.dp,
+                color = if (isCurrent) accentColor else uiColors.cardBorder,
+                shape = RoundedCornerShape(20.dp)
+            )
+            .clickable { onClick() }
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(Color.LightGray)
+        ) {
+            AsyncImage(
+                model = song.thumbnailUrl,
+                contentDescription = "Thumbnail",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            if (isCurrent && isPlaying) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.5f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    SoundwaveIndicator(color = accentColor)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.width(12.dp))
+
+        Column(
+            modifier = Modifier.weight(1f)
+        ) {
+            Text(
+                text = song.title,
+                color = if (isCurrent) accentColor else uiColors.textPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = if (!song.album.isNullOrBlank())
+                    "${song.artist} • ${song.album}"
+                else
+                    song.artist,
+                color = uiColors.textSecondary,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (isCurrent && onPlayPauseClick != null) {
+            Spacer(modifier = Modifier.width(8.dp))
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(accentColor, shape = CircleShape)
+                    .clickable { onPlayPauseClick() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = "Play/Pause",
+                    tint = Color.White,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
     }
 }
 
@@ -936,4 +1915,70 @@ fun extractAccentColor(bitmap: Bitmap, defaultColor: Color): Color {
         bestColor = Color(android.graphics.Color.HSVToColor(hsvOut))
     }
     return bestColor
+}
+
+@Composable
+fun DefaultToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    uiColors: UIColors,
+    accentColor: Color
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(uiColors.cardBackground)
+            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(12.dp))
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column {
+            Text(
+                text = title,
+                color = uiColors.textPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = subtitle,
+                color = uiColors.textSecondary,
+                fontSize = 10.sp
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = accentColor,
+                uncheckedThumbColor = uiColors.textSecondary,
+                uncheckedTrackColor = uiColors.cardBorder,
+                uncheckedBorderColor = Color.Transparent
+            ),
+            modifier = Modifier.graphicsLayer(scaleX = 0.8f, scaleY = 0.8f)
+        )
+    }
+}
+
+@Composable
+fun SignatureBadge(text: String, uiColors: UIColors) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(uiColors.cardBackground)
+            .border(1.dp, uiColors.cardBorder, RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = text,
+            color = uiColors.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
 }

@@ -4,15 +4,21 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.convenemusic.network.InnerTubeClient
 import com.example.convenemusic.network.Song
-import com.example.convenemusic.playback.PlaybackManager
+import com.example.convenemusic.network.LyricLine
+import com.example.convenemusic.network.LyricsData
+import com.example.convenemusic.playback.AndroidMediaPlayerEngine
+import com.example.convenemusic.playback.AutoplayEngine
 import com.example.convenemusic.playback.PlaybackServiceConnector
 import com.example.convenemusic.data.repository.LocalMediaRepository
 import com.example.convenemusic.data.repository.LocalMediaRepositoryImpl
@@ -21,17 +27,23 @@ import com.example.convenemusic.data.repository.HistoryRepositoryImpl
 import com.example.convenemusic.data.repository.DownloadRepository
 import com.example.convenemusic.data.repository.DownloadRepositoryImpl
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 val Song.viewCount: Long
     get() {
         val text = viewsText ?: return 0L
@@ -53,14 +65,48 @@ val Song.viewCount: Long
 
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val client = InnerTubeClient()
-    val playbackManager = PlaybackManager(application.applicationContext)
+    private val loadingThumbnails = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    val mediaPlayerEngine = AndroidMediaPlayerEngine(application.applicationContext)
+    private lateinit var autoplayEngine: AutoplayEngine
+    private val backgroundScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    /** Returns true if the device has an active network connection with internet capability */
+    fun isNetworkAvailable(): Boolean {
+        val cm = getApplication<Application>().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    fun showNoInternetToast() {
+        Toast.makeText(
+            getApplication<Application>().applicationContext,
+            "No internet connection",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
 
     private val localMediaRepository: LocalMediaRepository = LocalMediaRepositoryImpl(application)
     private val historyRepository: HistoryRepository = HistoryRepositoryImpl(application)
     private val downloadRepository: DownloadRepository = DownloadRepositoryImpl(application, client)
+    private val downloadJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    private val _customPlaylists = MutableStateFlow<List<CustomPlaylist>>(emptyList())
+    val customPlaylists: StateFlow<List<CustomPlaylist>> = _customPlaylists.asStateFlow()
+    private val playlistsFile = File(application.filesDir, "custom_playlists.json")
 
     private val _searchResults = MutableStateFlow<List<Song>>(emptyList())
     val searchResults: StateFlow<List<Song>> = _searchResults.asStateFlow()
+
+    private val _lyrics = MutableStateFlow<LyricsData?>(null)
+    val lyrics: StateFlow<LyricsData?> = _lyrics.asStateFlow()
+
+    private val _isLyricsLoading = MutableStateFlow(false)
+    val isLyricsLoading: StateFlow<Boolean> = _isLyricsLoading.asStateFlow()
+
+    private val _lyricsError = MutableStateFlow<String?>(null)
+    val lyricsError: StateFlow<String?> = _lyricsError.asStateFlow()
 
     private val _playlistResults = MutableStateFlow<List<com.example.convenemusic.network.Playlist>>(emptyList())
     val playlistResults: StateFlow<List<com.example.convenemusic.network.Playlist>> = _playlistResults.asStateFlow()
@@ -99,6 +145,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _isQueueLoadingMore = MutableStateFlow(false)
     val isQueueLoadingMore: StateFlow<Boolean> = _isQueueLoadingMore.asStateFlow()
 
+    private val _loopMode = MutableStateFlow(0)
+    val loopMode: StateFlow<Int> = _loopMode.asStateFlow()
+
+    private val _shuffleEnabled = MutableStateFlow(false)
+    val shuffleEnabled: StateFlow<Boolean> = _shuffleEnabled.asStateFlow()
+
     private val autoplayContinuationTokens = mutableMapOf<String, String>()
 
     private var _originalPlaylistTracks: List<Song> = emptyList()
@@ -135,19 +187,119 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val CHANNEL_ID = "downloads_channel"
 
     init {
-        playbackManager.onSongEnded = {
-            playNextSong()
+        autoplayEngine = AutoplayEngine(
+            client = client,
+            queue = _queue,
+            currentQueueIndex = _currentQueueIndex,
+            isQueueEndless = _isQueueEndless,
+            isQueueLoadingMore = _isQueueLoadingMore,
+            autoplayContinuationTokens = autoplayContinuationTokens,
+            getOriginalPlaylistTracks = { _originalPlaylistTracks },
+            getSongsForQuery = { query -> getSongsForQuery(query) }
+        )
+
+        viewModelScope.launch {
+            delay(4000)
+            _showSplash.value = false
         }
-        PlaybackServiceConnector.onNext = {
-            playNextSong()
+        // Pre-buffer the last played song in the background during the splash
+        // so playback starts instantly when the user taps Play
+        preloadLastSong()
+        PlaybackServiceConnector.onNext = { isAuto ->
+            playNextSong(isManual = !isAuto)
         }
         PlaybackServiceConnector.onPrevious = {
             playPreviousSong()
         }
         loadHistory()
         loadDownloads()
+        loadCustomPlaylists()
         createNotificationChannel()
         prefetchFamousArtists()
+
+        // Observe current song changes to update index, pre-buffer the next song, and fetch lyrics
+        viewModelScope.launch {
+            var fetchLyricsJob: kotlinx.coroutines.Job? = null
+            mediaPlayerEngine.currentSong.collect { song ->
+                fetchLyricsJob?.cancel()
+                _lyrics.value = null
+                _lyricsError.value = null
+                if (song != null) {
+                    val index = _queue.value.indexOfFirst { it.id == song.id }
+                    if (index >= 0 && index != _currentQueueIndex.value) {
+                        _currentQueueIndex.value = index
+                        prebufferNextSong()
+                    }
+                    fetchLyricsJob = viewModelScope.launch {
+                        fetchLyricsForSong(song)
+                    }
+                }
+            }
+        }
+
+        // Automatically save queue and index on any modification
+        viewModelScope.launch {
+            kotlinx.coroutines.flow.combine(_queue, _currentQueueIndex) { q, idx -> q to idx }
+                .collect {
+                    saveQueueState()
+                }
+        }
+    }
+
+    /**
+     * Fetches the stream URL for the last played song (already in PlaybackManager state)
+     * and calls playbackManager.preload() — preparing ExoPlayer without starting playback.
+     * When the user later taps Play, ExoPlayer is already buffered → instant start.
+     */
+    private fun preloadLastSong() {
+        loadQueueState()
+        val song = mediaPlayerEngine.currentSong.value ?: return
+        
+        // If queue wasn't restored successfully, initialize it with the current song
+        if (_queue.value.isEmpty()) {
+            _queue.value = listOf(song)
+            _currentQueueIndex.value = 0
+        }
+        _isQueueEndless.value = true
+
+        // Only preload network songs (not local files)
+        if (song.id.startsWith("/")) return
+
+        viewModelScope.launch {
+            try {
+                if (isNetworkAvailable()) {
+                    generateAutoplaySongs()
+                }
+            } catch (e: Exception) {
+                Log.e("MusicViewModel", "Failed to generate autoplay recommendations for restored song", e)
+            }
+        }
+
+        viewModelScope.launch {
+            try {
+                val url = if (downloadRepository.isDownloaded(song.id)) {
+                    val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
+                    File(downloadsDir, "${song.id}.mp3").absolutePath
+                } else {
+                    if (!isNetworkAvailable()) return@launch
+                    var streamUrl: String? = null
+                    for (attempt in 1..3) {
+                        streamUrl = try { client.getStreamUrl(song.id) } catch (e: Exception) { null }
+                        if (streamUrl != null) break
+                        if (attempt < 3) delay(500L * (1 shl attempt))
+                    }
+                    streamUrl
+                } ?: return@launch
+
+                val artworkBytes = mediaPlayerEngine.getArtworkBytes(song.thumbnailUrl)
+                mediaPlayerEngine.preload(song, url, artworkBytes)
+                Log.e("MusicViewModel", "preloadLastSong: Pre-buffered '${song.title}'")
+            } catch (e: Exception) {
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    Log.e("MusicViewModel", "preloadLastSong: Failed for ${song.title}: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun prefetchFamousArtists() {
@@ -176,16 +328,39 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun loadArtistThumbnail(artistName: String) {
+        if (artistName.isBlank() || _artistThumbnails.value.containsKey(artistName)) return
+        if (!loadingThumbnails.add(artistName)) return
+        viewModelScope.launch {
+            try {
+                if (!isNetworkAvailable()) return@launch
+                val thumb = client.getArtistThumbnail(artistName)
+                if (thumb != null) {
+                    _artistThumbnails.value = _artistThumbnails.value + (artistName to thumb)
+                }
+            } catch (e: Exception) {
+                Log.e("MusicViewModel", "Failed to load thumbnail for $artistName", e)
+            } finally {
+                loadingThumbnails.remove(artistName)
+            }
+        }
+    }
+
+    private val _showSplash = MutableStateFlow(true)
+    val showSplash = _showSplash.asStateFlow()
+
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     private val _isPlaylistLoading = MutableStateFlow(false)
     val isPlaylistLoading: StateFlow<Boolean> = _isPlaylistLoading.asStateFlow()
 
-    val currentSong: StateFlow<Song?> = playbackManager.currentSong
-    val isPlaying: StateFlow<Boolean> = playbackManager.isPlaying
-    val currentPosition: StateFlow<Long> = playbackManager.currentPosition
-    val duration: StateFlow<Long> = playbackManager.duration
+    val currentSong: StateFlow<Song?> = mediaPlayerEngine.currentSong
+    val isPlaying: StateFlow<Boolean> = mediaPlayerEngine.isPlaying
+    val currentPosition: StateFlow<Long> = mediaPlayerEngine.currentPosition
+    val duration: StateFlow<Long> = mediaPlayerEngine.duration
+    /** Reflects ExoPlayer's STATE_BUFFERING — true while the player is filling its network buffer */
+    val isBuffering: StateFlow<Boolean> = mediaPlayerEngine.isBuffering
 
     private var songContinuationToken: String? = null
     private var playlistContinuationToken: String? = null
@@ -194,12 +369,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val isLoadMoreLoading: StateFlow<Boolean> = _isLoadMoreLoading.asStateFlow()
 
     private val _isStreamLoading = MutableStateFlow(false)
+    /** True while the stream URL is being fetched OR while ExoPlayer is buffering */
     val isStreamLoading: StateFlow<Boolean> = _isStreamLoading.asStateFlow()
 
     private fun splitArtistNames(combinedName: String): List<String> {
         val bulletParts = combinedName.split(Regex(" • | •|• |•|\\u2022"))
         val mainArtistPart = bulletParts.firstOrNull()?.trim() ?: combinedName
-        val separators = Regex(",|/|\\||&|\\s+\\.\\s+|\\bx\\b|\\bX\\b|\\band\\b|\\bfeat\\.?\\b|\\bft\\.?\\b", RegexOption.IGNORE_CASE)
+        val separators = Regex(",|/|\\||&|\\s+\\.\\s+|\\bx\\b|\\bX\\b|\\band\\b|\\bfeat(?:\\.|\\b)|\\bft(?:\\.|\\b)", RegexOption.IGNORE_CASE)
         return mainArtistPart.split(separators)
             .map { it.trim() }
             .filter { it.isNotEmpty() && !it.equals("unknown", ignoreCase = true) }
@@ -317,6 +493,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         // Cancel the previous job and launch a debounced online search
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
+            // Check internet before hitting the network
+            if (!isNetworkAvailable()) {
+                showNoInternetToast()
+                _isLoading.value = false
+                return@launch
+            }
             _isLoading.value = true
             // Debounce online search for 300ms
             kotlinx.coroutines.delay(300)
@@ -331,6 +513,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 if (e !is kotlinx.coroutines.CancellationException) {
                     Log.e("MusicViewModel", "Search online failed: ${e.message}", e)
+                    if (!isNetworkAvailable()) showNoInternetToast()
                 }
             } finally {
                 _isLoading.value = false
@@ -492,35 +675,74 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun playSongInternal(song: Song) {
         Log.e("MusicViewModel", "playSongInternal: Playing ${song.title}")
-        playbackManager.setCurrentSong(song)
+        acquireTransitionWakeLock()
+        mediaPlayerEngine.setCurrentSong(song)
         addToHistory(song)
-        viewModelScope.launch {
+        backgroundScope.launch(Dispatchers.IO) {
             _isStreamLoading.value = true
-            val urlDeferred = async {
-                if (song.id.startsWith("/")) {
-                    song.id
-                } else if (downloadRepository.isDownloaded(song.id)) {
-                    val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
-                    val localFile = File(downloadsDir, "${song.id}.mp3")
-                    Log.e("MusicViewModel", "playSongInternal: Local file found. Playing offline: ${localFile.absolutePath}")
-                    localFile.absolutePath
-                } else {
-                    client.getStreamUrl(song.id)
+            try {
+                val urlDeferred = async(Dispatchers.IO) {
+                    if (song.id.startsWith("/")) {
+                        song.id
+                    } else if (downloadRepository.isDownloaded(song.id)) {
+                        val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
+                        val localFile = File(downloadsDir, "${song.id}.mp3")
+                        Log.e("MusicViewModel", "playSongInternal: Local file found. Playing offline: ${localFile.absolutePath}")
+                        localFile.absolutePath
+                    } else if (song.id == prefetchedSongId && prefetchedUrl != null) {
+                        Log.e("MusicViewModel", "playSongInternal: Using prefetched URL for ${song.title}")
+                        prefetchedUrl
+                    } else {
+                        // Retry up to 3 times for network stream URLs with exponential backoff
+                        var streamUrl: String? = null
+                        for (attempt in 1..3) {
+                            streamUrl = try {
+                                client.getStreamUrl(song.id)
+                            } catch (e: Exception) {
+                                Log.e("MusicViewModel", "playSongInternal: Attempt $attempt failed for ${song.title}: ${e.message}")
+                                null
+                            }
+                            if (streamUrl != null) break
+                            if (attempt < 3) delay(500L * (1 shl attempt))
+                        }
+                        streamUrl
+                    }
                 }
+                val artworkDeferred = async(Dispatchers.IO) {
+                    if (song.id == prefetchedSongId && prefetchedArtwork != null) {
+                        prefetchedArtwork
+                    } else {
+                        mediaPlayerEngine.getArtworkBytes(song.thumbnailUrl)
+                    }
+                }
+
+                val url = urlDeferred.await()
+                val artworkBytes = artworkDeferred.await()
+
+                if (url != null) {
+                    withContext(Dispatchers.Main) {
+                        mediaPlayerEngine.play(song, url, artworkBytes)
+                        // Start prebuffering the next track immediately after starting playback
+                        prebufferNextSong()
+                    }
+                } else {
+                    Log.e("MusicViewModel", "playSongInternal: Failed to resolve stream URL for ${song.title} after retries")
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            getApplication<Application>().applicationContext,
+                            "Could not load: ${song.title.take(40)}",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            } catch (e: Exception) {
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    Log.e("MusicViewModel", "playSongInternal: Unexpected error for ${song.title}: ${e.message}", e)
+                }
+            } finally {
+                _isStreamLoading.value = false
+                releaseTransitionWakeLock()
             }
-            val artworkDeferred = async {
-                playbackManager.getArtworkBytes(song.thumbnailUrl)
-            }
-            
-            val url = urlDeferred.await()
-            val artworkBytes = artworkDeferred.await()
-            
-            if (url != null) {
-                playbackManager.play(song, url, artworkBytes)
-            } else {
-                Log.e("MusicViewModel", "playSongInternal: Failed to resolve stream URL for ${song.title}")
-            }
-            _isStreamLoading.value = false
         }
     }
 
@@ -530,9 +752,17 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         _isQueueEndless.value = !isPremadePlaylist
         _originalPlaylistTracks = initialQueue
         if (initialQueue.isNotEmpty()) {
-            _queue.value = initialQueue
-            val index = initialQueue.indexOfFirst { it.id == song.id }
-            _currentQueueIndex.value = if (index >= 0) index else 0
+            if (_shuffleEnabled.value) {
+                val shuffled = initialQueue.shuffled().toMutableList()
+                shuffled.remove(song)
+                shuffled.add(0, song)
+                _queue.value = shuffled
+                _currentQueueIndex.value = 0
+            } else {
+                _queue.value = initialQueue
+                val index = initialQueue.indexOfFirst { it.id == song.id }
+                _currentQueueIndex.value = if (index >= 0) index else 0
+            }
         } else {
             _queue.value = listOf(song)
             _currentQueueIndex.value = 0
@@ -545,9 +775,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun playNextSong() {
+    fun playNextSong(isManual: Boolean = false) {
+        acquireTransitionWakeLock()
         val currentList = _queue.value
-        val nextIndex = _currentQueueIndex.value + 1
+        val currentIndex = _currentQueueIndex.value
+
+        if (_loopMode.value == 1 && !isManual) {
+            val current = currentSong.value
+            if (current != null) {
+                playSongInternal(current)
+            } else {
+                releaseTransitionWakeLock()
+            }
+            return
+        }
+
+        val nextIndex = currentIndex + 1
         if (nextIndex < currentList.size) {
             _currentQueueIndex.value = nextIndex
             val nextSong = currentList[nextIndex]
@@ -558,36 +801,48 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
         } else {
             if (_isQueueEndless.value) {
-                viewModelScope.launch {
+                backgroundScope.launch(Dispatchers.IO) {
                     val job = generateAutoplaySongs()
                     job?.join()
                     val updatedList = _queue.value
                     if (nextIndex < updatedList.size) {
-                        _currentQueueIndex.value = nextIndex
-                        val nextSong = updatedList[nextIndex]
-                        playSongInternal(nextSong)
+                        withContext(Dispatchers.Main) {
+                            _currentQueueIndex.value = nextIndex
+                            val nextSong = updatedList[nextIndex]
+                            playSongInternal(nextSong)
+                        }
                     } else {
-                        restartQueueOrStop(currentList)
+                        withContext(Dispatchers.Main) {
+                            handleQueueEnd(currentList)
+                        }
                     }
                 }
             } else {
-                restartQueueOrStop(currentList)
+                handleQueueEnd(currentList)
             }
         }
     }
 
-    private fun restartQueueOrStop(currentList: List<Song>) {
-        if (currentList.size > 1) {
-            _currentQueueIndex.value = 0
-            val firstSong = currentList[0]
-            playSongInternal(firstSong)
+    private fun handleQueueEnd(currentList: List<Song>) {
+        if (_loopMode.value == 2) {
+            if (currentList.isNotEmpty()) {
+                _currentQueueIndex.value = 0
+                playSongInternal(currentList[0])
+            } else {
+                releaseTransitionWakeLock()
+            }
+        } else {
+            releaseTransitionWakeLock()
+            mediaPlayerEngine.pause()
         }
     }
 
     fun playPreviousSong() {
-        val currentPos = playbackManager.currentPosition.value
+        acquireTransitionWakeLock()
+        val currentPos = mediaPlayerEngine.currentPosition.value
         if (currentPos >= 5000L) {
-            playbackManager.seekTo(0L)
+            mediaPlayerEngine.seekTo(0L)
+            releaseTransitionWakeLock()
         } else {
             val prevIndex = _currentQueueIndex.value - 1
             if (prevIndex >= 0) {
@@ -595,7 +850,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 val prevSong = _queue.value[prevIndex]
                 playSongInternal(prevSong)
             } else {
-                playbackManager.seekTo(0L)
+                mediaPlayerEngine.seekTo(0L)
+                releaseTransitionWakeLock()
             }
         }
     }
@@ -607,9 +863,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun getSongsForQuery(query: String): List<Song> {
+    private suspend fun getSongsForQuery(query: String): List<Song> = withContext(Dispatchers.IO) {
         val token = autoplayContinuationTokens[query]
-        return try {
+        try {
             val result = if (token != null) {
                 client.searchMoreSongs(token)
             } else {
@@ -628,130 +884,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun generateAutoplaySongs(): kotlinx.coroutines.Job? {
-        if (!_isQueueEndless.value) return null
-        if (_isQueueLoadingMore.value) return null
-        val currentList = _queue.value
-        val currentIndex = _currentQueueIndex.value
-        val currentSong = currentList.getOrNull(currentIndex) ?: return null
-
-        _isQueueLoadingMore.value = true
-        return viewModelScope.launch {
-            try {
-                val recommendations = mutableListOf<Song>()
-                val existingIds = currentList.map { it.id }.toSet()
-
-                val originalPlaylistTracks = _originalPlaylistTracks
-                if (originalPlaylistTracks.isNotEmpty()) {
-                    val artistFrequencies = originalPlaylistTracks
-                        .map { it.artist }
-                        .filter { it.isNotBlank() && !it.contains("unknown", ignoreCase = true) }
-                        .groupingBy { it }
-                        .eachCount()
-
-                    val topArtists = artistFrequencies.entries
-                        .sortedByDescending { it.value }
-                        .map { it.key }
-                        .take(3)
-
-                    if (topArtists.isNotEmpty()) {
-                        for (artist in topArtists) {
-                            try {
-                                val newSongs = getSongsForQuery(artist)
-                                recommendations.addAll(newSongs)
-                            } catch (e: Exception) {
-                                Log.e("MusicViewModel", "Autoplay search error for artist $artist", e)
-                            }
-                        }
-                    } else {
-                        try {
-                            val newSongs = getSongsForQuery(currentSong.artist)
-                            recommendations.addAll(newSongs)
-                        } catch (e: Exception) {
-                            Log.e("MusicViewModel", "Autoplay search error for artist ${currentSong.artist}", e)
-                        }
-                    }
-                } else {
-                    try {
-                        val newSongs = getSongsForQuery(currentSong.artist)
-                        recommendations.addAll(newSongs)
-                    } catch (e: Exception) {
-                        Log.e("MusicViewModel", "Autoplay search error for artist ${currentSong.artist}", e)
-                    }
-                }
-
-                var filteredRecs = recommendations
-                    .filter { it.id !in existingIds }
-                    .distinctBy { it.id }
-
-                if (filteredRecs.isEmpty() && currentList.isNotEmpty()) {
-                    Log.d("MusicViewModel", "Autoplay: Fallback 1 - Trying other unique artists from the queue")
-                    val uniqueArtists = currentList.map { it.artist }
-                        .filter { it.isNotBlank() && !it.contains("unknown", ignoreCase = true) }
-                        .distinct()
-                    val shuffledArtists = uniqueArtists.shuffled().take(3)
-                    for (artist in shuffledArtists) {
-                        try {
-                            val newRecs = getSongsForQuery(artist).filter { it.id !in existingIds }
-                            recommendations.addAll(newRecs)
-                        } catch (e: Exception) {
-                            Log.e("MusicViewModel", "Autoplay fallback search error for artist $artist", e)
-                        }
-                    }
-                    filteredRecs = recommendations
-                        .filter { it.id !in existingIds }
-                        .distinctBy { it.id }
-                }
-
-                if (filteredRecs.isEmpty() && currentList.isNotEmpty()) {
-                    Log.d("MusicViewModel", "Autoplay: Fallback 2 - Searching by song titles from the queue")
-                    val shuffledSongs = currentList.shuffled().take(2)
-                    for (songItem in shuffledSongs) {
-                        try {
-                            val newRecs = getSongsForQuery(songItem.title).filter { it.id !in existingIds }
-                            recommendations.addAll(newRecs)
-                        } catch (e: Exception) {
-                            Log.e("MusicViewModel", "Autoplay fallback search error for title ${songItem.title}", e)
-                        }
-                    }
-                    filteredRecs = recommendations
-                        .filter { it.id !in existingIds }
-                        .distinctBy { it.id }
-                }
-
-                if (filteredRecs.isEmpty()) {
-                    Log.d("MusicViewModel", "Autoplay: Fallback 3 - Generic query search")
-                    val genericQueries = listOf("popular music", "hits", "trending songs", "lofi chill", "acoustic hits", "top tracks")
-                    val query = genericQueries.random()
-                    try {
-                        val newRecs = getSongsForQuery(query)
-                        recommendations.addAll(newRecs)
-                    } catch (e: Exception) {
-                        Log.e("MusicViewModel", "Autoplay fallback search error for query $query", e)
-                    }
-                    filteredRecs = recommendations
-                        .filter { it.id !in existingIds }
-                        .distinctBy { it.id }
-                }
-
-                val finalRecs = filteredRecs
-                    .shuffled()
-                    .take(15)
-
-                if (finalRecs.isNotEmpty()) {
-                    _queue.value = currentList + finalRecs
-                    Log.d("MusicViewModel", "Autoplay: Appended ${finalRecs.size} tracks to the queue. Total size: ${_queue.value.size}")
-                } else {
-                    Log.e("MusicViewModel", "Autoplay: Failed to find any new tracks even after all fallbacks!")
-                }
-            } finally {
-                _isQueueLoadingMore.value = false
-            }
-        }
+        return autoplayEngine.generateAutoplaySongs(backgroundScope)
     }
 
     fun togglePlayPause() {
         val current = currentSong.value
-        if (current != null && playbackManager.isIdle()) {
+        if (current != null && mediaPlayerEngine.isIdle()) {
             if (_queue.value.isEmpty()) {
                 _queue.value = listOf(current)
                 _currentQueueIndex.value = 0
@@ -759,15 +897,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playSongInternal(current)
         } else {
             if (isPlaying.value) {
-                playbackManager.pause()
+                mediaPlayerEngine.pause()
             } else {
-                playbackManager.resume()
+                mediaPlayerEngine.resume()
             }
         }
     }
 
     fun seekTo(positionMs: Long) {
-        playbackManager.seekTo(positionMs)
+        mediaPlayerEngine.seekTo(positionMs)
     }
 
     fun loadHistory() {
@@ -821,14 +959,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun downloadSong(song: Song) {
-        if (_downloadingSongs.value.contains(song.id)) return
-        if (downloadRepository.isDownloaded(song.id)) return
+        if (_downloadingSongs.value.contains(song.id)) {
+            cancelDownload(song.id)
+            return
+        }
+        if (downloadRepository.isDownloaded(song.id)) {
+            deleteDownloadedSong(song.id)
+            return
+        }
 
         _downloadingSongs.value = _downloadingSongs.value + song.id
         _downloadingQueue.value = _downloadingQueue.value + song
         _downloadProgress.value = _downloadProgress.value + (song.id to 0)
 
-        viewModelScope.launch {
+        val job = viewModelScope.launch {
             val context = getApplication<Application>().applicationContext
             val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val notificationId = song.id.hashCode()
@@ -872,22 +1016,165 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     // Ignore
                 }
             } else {
-                val failBuilder = NotificationCompat.Builder(context, CHANNEL_ID)
-                    .setContentTitle("Download Failed")
-                    .setContentText(song.title)
-                    .setSmallIcon(android.R.drawable.stat_notify_error)
-                    .setPriority(NotificationCompat.PRIORITY_LOW)
-                    .setOngoing(false)
-                try {
-                    notificationManager.notify(notificationId, failBuilder.build())
-                } catch (se: SecurityException) {
-                    // Ignore
+                // If it wasn't cancelled, show fail notification
+                if (_downloadingSongs.value.contains(song.id)) {
+                    val failBuilder = NotificationCompat.Builder(context, CHANNEL_ID)
+                        .setContentTitle("Download Failed")
+                        .setContentText(song.title)
+                        .setSmallIcon(android.R.drawable.stat_notify_error)
+                        .setPriority(NotificationCompat.PRIORITY_LOW)
+                        .setOngoing(false)
+                    try {
+                        notificationManager.notify(notificationId, failBuilder.build())
+                    } catch (se: SecurityException) {
+                        // Ignore
+                    }
                 }
             }
 
+            downloadJobs.remove(song.id)
             _downloadingSongs.value = _downloadingSongs.value - song.id
             _downloadingQueue.value = _downloadingQueue.value.filter { it.id != song.id }
             _downloadProgress.value = _downloadProgress.value - song.id
+        }
+        downloadJobs[song.id] = job
+    }
+
+    fun cancelDownload(songId: String) {
+        val job = downloadJobs.remove(songId)
+        job?.cancel()
+
+        _downloadingSongs.value = _downloadingSongs.value - songId
+        _downloadingQueue.value = _downloadingQueue.value.filter { it.id != songId }
+        _downloadProgress.value = _downloadProgress.value - songId
+
+        val notificationId = songId.hashCode()
+        val context = getApplication<Application>().applicationContext
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(notificationId)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
+            val tempFile = File(downloadsDir, "${songId}.tmp")
+            val mp3File = File(downloadsDir, "${songId}.mp3")
+            if (tempFile.exists()) tempFile.delete()
+            if (mp3File.exists()) mp3File.delete()
+            loadDownloads()
+        }
+    }
+
+    fun deleteDownloadedSong(songId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
+            val mp3File = File(downloadsDir, "${songId}.mp3")
+            if (mp3File.exists()) {
+                mp3File.delete()
+            }
+            val current = downloadRepository.loadDownloads()
+            val updated = current.filter { it.id != songId }
+            downloadRepository.saveDownloads(updated)
+            loadDownloads()
+        }
+    }
+
+    fun loadCustomPlaylists() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val list = if (playlistsFile.exists()) {
+                try {
+                    Json.decodeFromString<List<CustomPlaylist>>(playlistsFile.readText())
+                } catch (e: Exception) {
+                    Log.e("MusicViewModel", "Failed to load custom playlists", e)
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+            _customPlaylists.value = list
+        }
+    }
+
+    fun createCustomPlaylist(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val current = _customPlaylists.value
+            if (current.any { it.name.equals(name, ignoreCase = true) }) return@launch
+            val updated = current + CustomPlaylist(name = name, songs = emptyList())
+            saveCustomPlaylists(updated)
+        }
+    }
+
+    fun deleteCustomPlaylist(name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = _customPlaylists.value.filter { !it.name.equals(name, ignoreCase = true) }
+            saveCustomPlaylists(updated)
+        }
+    }
+
+    fun addSongToCustomPlaylist(playlistName: String, song: Song) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = _customPlaylists.value.map { playlist ->
+                if (playlist.name.equals(playlistName, ignoreCase = true)) {
+                    if (playlist.songs.any { it.id == song.id }) {
+                        playlist
+                    } else {
+                        playlist.copy(songs = playlist.songs + song)
+                    }
+                } else {
+                    playlist
+                }
+            }
+            saveCustomPlaylists(updated)
+        }
+    }
+
+    fun removeSongFromCustomPlaylist(playlistName: String, songId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = _customPlaylists.value.map { playlist ->
+                if (playlist.name.equals(playlistName, ignoreCase = true)) {
+                    playlist.copy(songs = playlist.songs.filter { it.id != songId })
+                } else {
+                    playlist
+                }
+            }
+            saveCustomPlaylists(updated)
+        }
+    }
+
+    private fun saveCustomPlaylists(list: List<CustomPlaylist>) {
+        try {
+            playlistsFile.writeText(Json.encodeToString(list))
+            _customPlaylists.value = list
+        } catch (e: Exception) {
+            Log.e("MusicViewModel", "Failed to save custom playlists", e)
+        }
+    }
+
+    private var transitionWakeLock: android.os.PowerManager.WakeLock? = null
+
+    private fun acquireTransitionWakeLock(timeoutMs: Long = 20000) {
+        try {
+            if (transitionWakeLock == null) {
+                val powerManager = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                transitionWakeLock = powerManager.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "ConveneMusic:AutoplayWakeLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            transitionWakeLock?.acquire(timeoutMs)
+            Log.d("MusicViewModel", "Transition WakeLock acquired for $timeoutMs ms")
+        } catch (e: Exception) {
+            Log.e("MusicViewModel", "Failed to acquire WakeLock", e)
+        }
+    }
+
+    private fun releaseTransitionWakeLock() {
+        try {
+            transitionWakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.d("MusicViewModel", "Transition WakeLock released")
+                }
+            }
+        } catch (e: Exception) {
+            // Ignore
         }
     }
 
@@ -916,7 +1203,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        playbackManager.release()
+        backgroundScope.cancel()
+        mediaPlayerEngine.release()
     }
 
     fun clearLocalTracks() {
@@ -941,4 +1229,215 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    private var isQueueLoaded = false
+
+    private fun saveQueueState() {
+        if (!isQueueLoaded) return
+        try {
+            val prefs = getApplication<Application>().getSharedPreferences("convenemusic_prefs", Context.MODE_PRIVATE)
+            val queueJson = Json.encodeToString(_queue.value)
+            prefs.edit()
+                .putString("saved_queue", queueJson)
+                .putInt("saved_queue_index", _currentQueueIndex.value)
+                .apply()
+            Log.d("MusicViewModel", "Queue state saved: ${_queue.value.size} songs, index: ${_currentQueueIndex.value}")
+        } catch (e: Exception) {
+            Log.e("MusicViewModel", "Failed to save queue state", e)
+        }
+    }
+
+    private fun loadQueueState() {
+        try {
+            val prefs = getApplication<Application>().getSharedPreferences("convenemusic_prefs", Context.MODE_PRIVATE)
+            val queueJson = prefs.getString("saved_queue", null)
+            val index = prefs.getInt("saved_queue_index", 0)
+            if (queueJson != null) {
+                val savedQueue = Json.decodeFromString<List<Song>>(queueJson)
+                if (savedQueue.isNotEmpty()) {
+                    _queue.value = savedQueue
+                    _currentQueueIndex.value = if (index in savedQueue.indices) index else 0
+                    Log.d("MusicViewModel", "Queue state restored: ${savedQueue.size} songs, index: ${_currentQueueIndex.value}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MusicViewModel", "Failed to load queue state", e)
+        } finally {
+            isQueueLoaded = true
+        }
+    }
+
+    private var prefetchedSongId: String? = null
+    private var prefetchedUrl: String? = null
+    private var prefetchedArtwork: ByteArray? = null
+    private var prebufferJob: kotlinx.coroutines.Job? = null
+
+    private fun prebufferNextSong() {
+        prebufferJob?.cancel()
+        val currentList = _queue.value
+        val nextIndex = _currentQueueIndex.value + 1
+        if (nextIndex < currentList.size) {
+            val nextSong = currentList[nextIndex]
+            if (nextSong.id.startsWith("/")) {
+                mediaPlayerEngine.setNextSong(nextSong, nextSong.id, null)
+                return
+            }
+            prebufferJob = backgroundScope.launch(Dispatchers.IO) {
+                try {
+                    val url = if (downloadRepository.isDownloaded(nextSong.id)) {
+                        val downloadsDir = File(getApplication<Application>().filesDir, ".downloads")
+                        File(downloadsDir, "${nextSong.id}.mp3").absolutePath
+                    } else {
+                        if (!isNetworkAvailable()) null
+                        else {
+                            var streamUrl: String? = null
+                            for (attempt in 1..3) {
+                                streamUrl = try {
+                                    client.getStreamUrl(nextSong.id)
+                                } catch (e: Exception) {
+                                    null
+                                }
+                                if (streamUrl != null) break
+                                if (attempt < 3) delay(500L * (1 shl attempt))
+                            }
+                            streamUrl
+                        }
+                    }
+                    if (url != null) {
+                        prefetchedSongId = nextSong.id
+                        prefetchedUrl = url
+                        val artworkBytes = mediaPlayerEngine.getArtworkBytes(nextSong.thumbnailUrl)
+                        prefetchedArtwork = artworkBytes
+                        withContext(Dispatchers.Main) {
+                            mediaPlayerEngine.setNextSong(nextSong, url, artworkBytes)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("MusicViewModel", "Failed to prebuffer next song: ${e.message}")
+                }
+            }
+        } else if (_isQueueEndless.value) {
+            backgroundScope.launch(Dispatchers.IO) {
+                val job = generateAutoplaySongs()
+                job?.join()
+                val updatedIndex = _currentQueueIndex.value + 1
+                if (updatedIndex < _queue.value.size) {
+                    withContext(Dispatchers.Main) {
+                        prebufferNextSong()
+                    }
+                }
+            }
+        }
+    }
+
+    fun toggleLoopMode() {
+        _loopMode.value = (_loopMode.value + 1) % 3
+    }
+
+    fun toggleShuffle() {
+        val nextShuffle = !_shuffleEnabled.value
+        _shuffleEnabled.value = nextShuffle
+
+        val current = currentSong.value
+        if (nextShuffle) {
+            val currentQueue = _queue.value
+            if (currentQueue.isNotEmpty()) {
+                val shuffled = currentQueue.shuffled().toMutableList()
+                if (current != null) {
+                    shuffled.remove(current)
+                    shuffled.add(0, current)
+                }
+                _queue.value = shuffled
+                _currentQueueIndex.value = 0
+            }
+        } else {
+            val original = _originalPlaylistTracks
+            if (original.isNotEmpty()) {
+                _queue.value = original
+                val index = original.indexOfFirst { it.id == current?.id }
+                _currentQueueIndex.value = if (index >= 0) index else 0
+            }
+        }
+    }
+
+    private fun cleanTrackName(title: String): String {
+        return title
+            .replace(Regex("""\s*[\(\[][Oo]fficial\s+[Vv]ideo[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][Oo]fficial\s+[Mm]usic\s+[Vv]ideo[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][Oo]fficial\s+[Aa]udio[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][Mm]usic\s+[Vv]ideo[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][Ll]yric\s+[Vv]ideo[\)\]]"""), "")
+            .replace(Regex("""\s*[\(\[][Ll]yrics[\)\]]"""), "")
+            .replace(Regex("""\s*-\s*Topic$"""), "")
+            .trim()
+    }
+
+    private fun cleanArtistName(artist: String): String {
+        val separators = Regex(""",|/|\||&|\bfeat\b|\bft\b|\bX\b|\bx\b|\band\b""", RegexOption.IGNORE_CASE)
+        val firstArtist = artist.split(separators).firstOrNull()?.trim() ?: artist
+        return firstArtist.replace(Regex("\\s*•\\s*\\d+:\\d+\\s*$"), "").trim()
+    }
+
+    private suspend fun fetchLyricsForSong(song: Song) {
+        val videoId = song.id
+        if (videoId.isBlank()) return
+        if (videoId.startsWith("/")) {
+            _lyrics.value = null
+            return
+        }
+        _isLyricsLoading.value = true
+        _lyricsError.value = null
+        try {
+            if (!isNetworkAvailable()) {
+                _lyricsError.value = "No internet connection"
+                _lyrics.value = null
+                return
+            }
+            
+            val cleanTitle = cleanTrackName(song.title)
+            val cleanArtist = cleanArtistName(song.artist)
+            
+            Log.i("MusicViewModel", "Fetching LRCLib lyrics for: $cleanTitle by $cleanArtist (duration: ${song.durationSeconds})")
+            var lrcText = client.getLrcLyrics(cleanTitle, cleanArtist, song.durationSeconds)
+            
+            if (lrcText.isNullOrBlank()) {
+                Log.w("MusicViewModel", "LRCLib lyrics not found. Falling back to YTM lyrics for videoId $videoId")
+                val browseId = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                    client.getLyricsBrowseId(videoId)
+                }
+                if (browseId != null) {
+                    lrcText = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                        client.getLyrics(browseId)
+                    }
+                }
+            }
+            
+            if (!lrcText.isNullOrBlank()) {
+                val parsed = client.parseLyricsText(lrcText)
+                _lyrics.value = parsed
+            } else {
+                _lyrics.value = null
+            }
+        } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.e("MusicViewModel", "Error fetching lyrics for ${song.title}: ${e.message}", e)
+            _lyricsError.value = e.message ?: "Failed to fetch lyrics"
+            _lyrics.value = null
+        } finally {
+            _isLyricsLoading.value = false
+        }
+    }
+
+    fun retryLyrics() {
+        val song = currentSong.value ?: return
+        viewModelScope.launch {
+            fetchLyricsForSong(song)
+        }
+    }
 }
+
+@kotlinx.serialization.Serializable
+data class CustomPlaylist(
+    val name: String,
+    val songs: List<Song> = emptyList()
+)
